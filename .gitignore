@@ -1,0 +1,12 @@
+/target/
+__pycache__/
+*.py[cod]
+/docs/
+/README*
+/readme*
+/rust-style.md
+/tools/
+/tests/tooling/
+/.cargo/config.toml
+/AGENTS.md
+/research.asset

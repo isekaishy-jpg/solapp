@@ -1,0 +1,9 @@
+[package]
+name = "solapp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+description = "Application and host coordination research scaffold for the Sol libraries"
+
+[dependencies]
