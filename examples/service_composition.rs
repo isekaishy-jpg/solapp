@@ -34,6 +34,12 @@ fn runtime() -> SWRuntime {
         .build()
         .unwrap()
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkLifecycle {
+    Running,
+    Draining,
+}
+
 struct Demo<'scope> {
     runtime: &'scope mut SWRuntime,
     cleanup: &'scope SCCleanupContext<Rc<Cell<usize>>>,
@@ -45,7 +51,7 @@ struct Demo<'scope> {
     work: Option<SAServiceId>,
     clean: Option<SAServiceId>,
     final_admitted: bool,
-    work_closed: bool,
+    lifecycle: WorkLifecycle,
     release: Option<SARawDeadline>,
     cleanup_visits_after_close: usize,
     cleaned: usize,
@@ -80,15 +86,51 @@ impl<'scope> Demo<'scope> {
             work: None,
             clean: None,
             final_admitted: false,
-            work_closed: false,
+            lifecycle: WorkLifecycle::Running,
             release: None,
             cleanup_visits_after_close: 0,
             cleaned: 0,
             joined: false,
         }
     }
+    fn begin_draining(&mut self, release: Option<SARawDeadline>) {
+        if self.lifecycle == WorkLifecycle::Running {
+            // Close admission and ordinary publication before closing their route.
+            self.lifecycle = WorkLifecycle::Draining;
+            self.release = release;
+            self.owner.close();
+            if let Some(route) = &mut self.route {
+                route.close().unwrap();
+            }
+            self.runtime.begin_shutdown();
+        } else if release.is_none() {
+            // Host retirement overrides the demonstration's delayed final release.
+            self.release = None;
+        }
+    }
+
+    fn retire(&mut self, cx: &mut SAContext<'_, Self>, raw: SARawTime, budget: usize) -> bool {
+        if self
+            .release
+            .is_none_or(|d| raw.elapsed() >= d.time().elapsed())
+        {
+            self.backing.take();
+        }
+        self.cleaned += self.cleanup.drain_budget(budget);
+        let route_quiet = self.route.as_ref().is_none_or(SWNotifyRoute::is_quiescent);
+        if route_quiet {
+            // A claimed notifier can still signal after close. Keep its SA wake
+            // destination until the route proves all such claims have retired.
+            if let Some(work) = self.work.take() {
+                cx.remove_service(work).unwrap();
+            }
+            self.joined = self.runtime.try_shutdown().unwrap();
+        }
+        self.backing.is_none() && self.cleanup.pending() == 0 && route_quiet && self.joined
+    }
+
     fn work(&mut self, _: &mut SAContext<'_, Self>, request: SAServiceRequest) -> SAServiceReport {
-        if self.work_closed {
+        if self.lifecycle == WorkLifecycle::Draining {
             return SAServiceReport::Quiescent;
         }
         // SA has consumed its wake before entry. Arm SW, inspect/pump its
@@ -121,11 +163,8 @@ impl<'scope> Demo<'scope> {
                 .unwrap();
         }
         if self.owner.state().as_slice() == [1, 7] {
-            self.owner.close();
-            route.close().unwrap();
-            self.runtime.begin_shutdown();
-            self.work_closed = true;
-            self.release = Some(request.raw.checked_add(Duration::from_millis(35)).unwrap());
+            let release = request.raw.checked_add(Duration::from_millis(35)).unwrap();
+            self.begin_draining(Some(release));
             // This source is finished. A separate SC source will make progress
             // without SW notifications or redraws after a later final release.
             return SAServiceReport::Quiescent;
@@ -158,15 +197,17 @@ impl SAApplication for Demo<'_> {
         self.work = Some(work);
         self.clean = Some(cx.register_service(spec)?);
         let wake = cx.wake(work)?;
-        let mut route = self
-            .runtime
-            .notification_route(move || wake.signal().map_err(std::io::Error::other))
-            .map_err(error)?;
-        let _owner_binding = route.watch_owner(&self.owner).map_err(error)?;
-        let _progress_binding = route.watch_progress().map_err(error)?;
-        // Bindings detach on Drop; keep these interests in the route itself.
-        self.bindings = vec![_owner_binding, _progress_binding];
-        self.route = Some(route);
+        self.route = Some(
+            self.runtime
+                .notification_route(move || wake.signal().map_err(std::io::Error::other))
+                .map_err(error)?,
+        );
+        // Retain the route and each installed binding before the next fallible
+        // step, so startup rollback can still observe notifier quiescence.
+        let route = self.route.as_mut().unwrap();
+        self.bindings
+            .push(route.watch_owner(&self.owner).map_err(error)?);
+        self.bindings.push(route.watch_progress().map_err(error)?);
         let prepared = self
             .owner
             .prepare_delivery(SWPhase(1), |state| state.push(1))
@@ -179,34 +220,26 @@ impl SAApplication for Demo<'_> {
         cx: &mut SAContext<'_, Self>,
         request: SAServiceRequest,
     ) -> SAServiceReport {
-        if Some(request.id) == self.work {
-            return self.work(cx, request);
+        let is_work = Some(request.id) == self.work;
+        if !is_work {
+            assert_eq!(Some(request.id), self.clean);
         }
-        assert_eq!(Some(request.id), self.clean);
-        if self.work_closed {
-            self.cleanup_visits_after_close += 1;
-            if self
-                .release
-                .is_some_and(|d| request.raw.elapsed() >= d.time().elapsed())
-            {
-                self.backing.take();
-            }
+        // Native host retirement services can run before the first stopping poll.
+        // Either service must close ordinary work before doing anything else.
+        if request.point == SAServicePoint::Retirement {
+            self.begin_draining(None);
         }
-        self.cleaned += self.cleanup.drain_budget(request.budget.records);
-        if self.work_closed
-            && self.backing.is_none()
-            && self.cleanup.pending() == 0
-            && self.route.as_ref().unwrap().is_quiescent()
-        {
-            // A claimed SW notifier may still signal after close. Keep its SA
-            // wake destination alive until those claims have retired.
-            if let Some(work) = self.work.take() {
-                cx.remove_service(work).unwrap();
+        if self.lifecycle == WorkLifecycle::Draining {
+            if !is_work {
+                self.cleanup_visits_after_close += 1;
             }
-            self.joined = self.runtime.try_shutdown().unwrap();
-            if self.joined {
+            if self.retire(cx, request.raw, request.budget.records) {
                 cx.request_stop();
             }
+        } else if is_work {
+            return self.work(cx, request);
+        } else {
+            self.cleaned += self.cleanup.drain_budget(request.budget.records);
         }
         if self.cleanup.pending() != 0 {
             SAServiceReport::Continue
@@ -214,19 +247,10 @@ impl SAApplication for Demo<'_> {
             SAServiceReport::Quiescent
         }
     }
-    fn stopping(&mut self, _: &mut SAContext<'_, Self>) -> SAStopProgress {
-        self.owner.close();
-        if let Some(route) = &mut self.route {
-            route.close().unwrap();
-        }
-        self.backing.take();
-        self.cleaned += self.cleanup.drain_budget(1);
-        self.runtime.begin_shutdown();
-        let route_quiet = self.route.as_ref().is_none_or(SWNotifyRoute::is_quiescent);
-        if route_quiet && self.cleanup.pending() == 0 {
-            self.joined = self.runtime.try_shutdown().unwrap();
-        }
-        if self.joined && route_quiet {
+    fn stopping(&mut self, cx: &mut SAContext<'_, Self>) -> SAStopProgress {
+        self.begin_draining(None);
+        let raw = cx.clock().raw;
+        if self.retire(cx, raw, 1) {
             SAStopProgress::Settled
         } else {
             SAStopProgress::Pending
@@ -243,7 +267,7 @@ fn main() {
     let exit = host.run(&mut app).unwrap();
     assert_eq!(app.owner.state().as_slice(), [1, 7]);
     assert_eq!(app.cleaned, 1);
-    assert!(app.cleanup_visits_after_close >= 2 && app.joined);
+    assert!(app.joined);
     assert_eq!(app.domain.snapshot().total_declared_bytes, 0);
     assert_eq!(exit.windows_retired, 1);
     // SA observations describe its own obligations. The separate assertions
@@ -261,54 +285,5 @@ fn main() {
 }
 
 #[cfg(test)]
-#[test]
-fn owner_wake_precedes_final_admission_and_sc_fallback_outlives_worker_route() {
-    use crate::backend::{BackendOps, test::TestBackend};
-    use crate::host::Core;
-    let cleanup = SCCleanupContext::new();
-    let mut runtime = runtime();
-    let mut app = Demo::new(&mut runtime, &cleanup);
-    let mut core = Core::<Demo<'_>>::new().unwrap();
-    let mut native = TestBackend::default();
-    core.clock.manual = Some(Duration::ZERO);
-    core.start(&mut app, BackendOps::Test(&mut native));
-    assert!(core.failure.is_none(), "{:?}", core.failure);
-    assert!(!app.final_admitted && app.owner.state().is_empty());
-    // There is no final completion yet. The owner's own interest admits it.
-    core.pump_ordinary(&mut app, BackendOps::Test(&mut native));
-    assert!(app.final_admitted);
-    let timeout = std::time::Instant::now() + Duration::from_secs(2);
-    while !app.work_closed {
-        assert!(
-            std::time::Instant::now() < timeout,
-            "worker publication did not progress"
-        );
-        core.clock.manual = Some(Duration::from_millis(10));
-        core.pump_ordinary(&mut app, BackendOps::Test(&mut native));
-        std::thread::yield_now();
-    }
-    assert_eq!(app.owner.state().as_slice(), [1, 7]);
-    assert!(app.backing.is_some() && app.cleaned == 0);
-    // The closed route cannot wake this independent final release. Only the
-    // cleanup source's raw fallback drives its bounded cleanup and stop.
-    core.clock.manual = Some(Duration::from_millis(100));
-    core.pump_ordinary(&mut app, BackendOps::Test(&mut native));
-    assert_eq!(app.cleaned, 1);
-    assert_eq!(app.domain.snapshot().total_declared_bytes, 0);
-    let mut millis = 100;
-    while !app.joined {
-        assert!(
-            std::time::Instant::now() < timeout,
-            "runtime did not join after quiescence"
-        );
-        millis += 10;
-        core.clock.manual = Some(Duration::from_millis(millis));
-        core.pump_ordinary(&mut app, BackendOps::Test(&mut native));
-        std::thread::yield_now();
-    }
-    assert!(app.joined);
-    core.poll_stop(&mut app, BackendOps::Test(&mut native));
-    assert_eq!(core.state, SAHostState::Retiring);
-    core.native_destroyed(native.complete_destruction().unwrap());
-    assert_eq!(core.state, SAHostState::Closed);
-}
+#[path = "../tests/unit/composition.rs"]
+mod tests;

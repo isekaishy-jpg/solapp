@@ -69,8 +69,14 @@ simulation policy is implied.
 
 ## Retirement
 
-Retirement-eligible services continue while the application reports pending
-domain work. Once it reports `Settled`, application service callbacks stop while
+Retirement-eligible services can run before the first `stopping()` poll and
+continue while the application reports pending domain work. The first retirement
+service must enter the application's draining state, closing task admission and
+ordinary owner publication before servicing shutdown. Use the same cleanup path
+for partial startup and repeated stopping
+polls; retain a notification route's SA wake destination until actual route
+quiescence. Report `Settled` only after the application's cleanup and joins finish.
+Once it reports `Settled`, application service callbacks stop while
 SA completes its own remaining native/helper/lease obligations. Internal progress
 does not depend on the closed ordinary post queue.
 
