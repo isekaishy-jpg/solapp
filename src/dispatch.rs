@@ -139,6 +139,8 @@ pub(crate) struct Dispatch<A: SAApplication> {
     markers: Vec<usize>,
     #[cfg(test)]
     pub(crate) fail_next_marker_reservation: bool,
+    #[cfg(test)]
+    pub(crate) fail_next_order_reservation: bool,
     next_sequence: u64,
     pub(crate) depth: usize,
 }
@@ -152,6 +154,8 @@ impl<A: SAApplication> Dispatch<A> {
             markers: Vec::new(),
             #[cfg(test)]
             fail_next_marker_reservation: false,
+            #[cfg(test)]
+            fail_next_order_reservation: false,
             next_sequence: 1,
             depth: 0,
         }
@@ -186,6 +190,10 @@ impl<A: SAApplication> Dispatch<A> {
             .checked_add(1)
             .ok_or(SAError::IdentityExhausted(SAIdentityKind::Subscription))?;
         let key = self.subscriptions.reserve()?;
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_order_reservation) {
+            return Err(SAError::AllocationFailed);
+        }
         self.order
             .try_reserve(1)
             .map_err(|_| SAError::AllocationFailed)?;

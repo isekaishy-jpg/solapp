@@ -45,6 +45,11 @@ impl SAApplication for App {
                 let removed = cx.remove_service(request.id).unwrap();
                 assert!(removed.active && removed.retired);
                 assert!(cx.service_state(request.id).unwrap().active);
+                assert_eq!(
+                    cx.core.services.counts(),
+                    (1, 1),
+                    "retired active service remains in shutdown snapshot"
+                );
             }
             if self.nested {
                 self.nested = false;

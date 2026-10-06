@@ -1,4 +1,4 @@
-# Solapp Windows extensions v5
+# Solapp Windows extensions v7
 
 Based on the reviewed winit 0.30.13 package, upstream revision
 `e9809ef54b18499bb4f2cac945719ecc2a61061b`. The upstream Apache-2.0 LICENSE
@@ -72,3 +72,37 @@ The public Solapp `cursor_visibility_smoke` example checks native counter
 changes through own hidden windows with synthetic client/capture messages.
 It restores the initial counter and does not move the physical pointer, change
 OS focus, send global input, or certify visible pixels/hardware cursor planes.
+
+V6 releases the destination window-state lock before `SetCapture` in all four
+mouse-button acquisition paths. Synchronous CaptureLost callbacks may request
+destination cursor state, release or transfer capture, or retire that window.
+After reentry, live destinations refresh visibility from freshly locked current
+flags and the existing actual capture/client checks. Native procedure recursion
+retains WindowData until the outer callback returns; `userdata_removed` prevents
+refresh or delivery of the original button event after native retirement.
+Capture counts, same-owner retention, last-button release, cursor selection,
+relative-mode suppression and ClipCursor rollback remain with their existing
+owners. Ordinary callback delivery is unchanged.
+
+Last-button release still decrements bookkeeping before any native operation and
+drops the state lock before `ReleaseCapture`. It now verifies actual capture is
+still owned by the releasing HWND, so an old destination's eventual button-up
+cannot release a different owner selected by a synchronous acquisition callback.
+CaptureLost remains a received reconciliation fact, not a permanent input gate:
+an original real button press received afterward is still delivered, and its
+later explicit release clears held state exactly once.
+
+Solapp's `tests/capture_transfer.rs` runs own hidden-window posted-message cases
+as isolated main-thread children with an independent parent watchdog. It covers
+all button acquisition paths, same-owner/multiple-button retention, callback
+visibility/release/transfer/retirement/stop, later input and service progress, and
+balanced retirement. These messages do not measure physical-input frequency.
+
+V7 commits each button acquisition's capture count after `SetCapture` returns,
+after checking native retirement, and only while the destination still owns
+capture. A synchronous callback can release and reacquire the destination with
+another button; its nested count now survives alongside the original press.
+No window-state lock spans `SetCapture`, and callbacks that leave capture released
+or transferred elsewhere do not resurrect the destination's count. The native
+regression covers both release orders after reentrant reacquisition, verifying
+capture and held input survive the first release and balance after the last.

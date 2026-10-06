@@ -181,3 +181,156 @@ fn failed_initialization_reservation_reuses_only_after_acknowledged_incarnation_
         Some(SAError::StaleIdentity)
     );
 }
+
+#[test]
+fn arena_candidate_survives_failed_admission_and_exhaustion_never_rejoins_free_chain() {
+    let mut arena = Arena::new(SAIdentityKind::Timer);
+    let unused = arena.reserve().unwrap();
+    assert_eq!(arena.reserve().unwrap(), unused);
+    assert_eq!(arena.get(unused), None);
+    arena.insert(unused, 10);
+    let mut last = arena.reserve().unwrap();
+    arena.entries[last.index as usize].incarnation = Some(u64::MAX);
+    last.generation = u64::MAX;
+    arena.insert(last, 20);
+    let live = arena.reserve().unwrap();
+    arena.insert(live, 30);
+    assert_eq!(arena.remove(last), Some(20));
+    assert_eq!(arena.remove(last), None);
+    assert_eq!(arena.remove(unused), Some(10));
+    let reused = arena.reserve().unwrap();
+    assert_eq!(reused.index, unused.index);
+    assert_eq!(reused.generation, unused.generation + 1);
+    assert_eq!(
+        arena.reserve().unwrap(),
+        reused,
+        "failed companion reservation leaves head unchanged"
+    );
+    arena.insert(reused, 40);
+    let fresh = arena.reserve().unwrap();
+    assert_eq!(fresh.index, 3);
+    assert_eq!(arena.get(unused), None);
+    assert_eq!(arena.get(last), None);
+    assert_eq!(arena.get(live), Some(&30));
+    assert_eq!(
+        arena
+            .iter()
+            .map(|(key, value)| (key.index, *value))
+            .collect::<Vec<_>>(),
+        [(0, 40), (2, 30)]
+    );
+}
+
+#[test]
+fn arena_selection_is_linear_for_fresh_admissions_and_constant_for_reuse() {
+    let mut arena = Arena::new(SAIdentityKind::Recipient);
+    let mut keys = Vec::new();
+    for value in 0..4096 {
+        let key = arena.reserve().unwrap();
+        arena.insert(key, value);
+        keys.push(key);
+    }
+    assert_eq!(arena.selection_steps, 4096);
+    let capacity = arena.entries.capacity();
+    for key in &keys {
+        assert!(arena.remove(*key).is_some());
+    }
+    assert_eq!(arena.entries.capacity(), capacity);
+    for value in 0..4096 {
+        let key = arena.reserve().unwrap();
+        arena.insert(key, value);
+    }
+    assert_eq!(arena.selection_steps, 8192);
+    assert_eq!(arena.entries.len(), 4096);
+    assert_eq!(arena.entries.capacity(), capacity);
+    println!("arena-selection: fresh=4096 steps=4096 reuse=4096 steps=4096");
+}
+
+#[test]
+fn arena_owned_values_follow_a_mixed_identity_model() {
+    use std::collections::HashMap;
+    use std::{cell::Cell, rc::Rc};
+    struct Owned {
+        value: usize,
+        drops: Rc<Cell<usize>>,
+    }
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+    let drops = Rc::new(Cell::new(0));
+    let mut admitted = 0;
+    let mut arena = Arena::new(SAIdentityKind::Subscription);
+    let mut model = HashMap::new();
+    let mut history = Vec::new();
+    let mut seed = 17_u64;
+    for value in 0..10000 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        if history.is_empty() || seed & 3 == 0 {
+            let key = arena.reserve().unwrap();
+            // Alternate failed-admission/retry before committing ownership.
+            if value & 1 == 0 {
+                assert_eq!(arena.reserve().unwrap(), key);
+            }
+            arena.insert(
+                key,
+                Owned {
+                    value,
+                    drops: Rc::clone(&drops),
+                },
+            );
+            admitted += 1;
+            assert_eq!(model.insert(key, value), None);
+            history.push(key);
+        } else {
+            let key = history[(seed as usize) % history.len()];
+            assert_eq!(
+                arena.get(key).map(|owned| owned.value),
+                model.get(&key).copied()
+            );
+            assert_eq!(
+                arena.remove(key).map(|owned| owned.value),
+                model.remove(&key)
+            );
+            assert!(arena.remove(key).is_none());
+        }
+        assert_eq!(arena.iter().count(), model.len());
+    }
+    for (key, value) in model {
+        assert_eq!(arena.remove(key).map(|owned| owned.value), Some(value));
+    }
+    assert_eq!(arena.iter().count(), 0);
+    assert_eq!(
+        drops.get(),
+        admitted,
+        "each committed owned value is disposed exactly once"
+    );
+}
+
+#[test]
+fn arena_removal_and_reuse_require_no_second_allocation() {
+    let mut arena = Arena::new(SAIdentityKind::Timer);
+    let mut keys = Vec::new();
+    for value in 0..4096 {
+        let key = arena.reserve().unwrap();
+        arena.insert(key, value);
+        keys.push(key);
+    }
+    let (_, remove_counts) = crate::allocation_probe::measure(|| {
+        for key in &keys {
+            assert!(arena.remove(*key).is_some());
+        }
+    });
+    let (_, reuse_counts) = crate::allocation_probe::measure(|| {
+        for value in 0..4096 {
+            let key = arena.reserve().unwrap();
+            arena.insert(key, value);
+        }
+    });
+    assert_eq!(remove_counts.allocations + remove_counts.reallocations, 0);
+    assert_eq!(reuse_counts.allocations + reuse_counts.reallocations, 0);
+    println!(
+        "arena-backing: removal=4096 allocations=0 reallocations=0 reuse=4096 allocations=0 reallocations=0"
+    );
+}

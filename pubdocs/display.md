@@ -42,6 +42,9 @@ client dimensions may be zero while minimized. A display request also does not
 prove renderer readiness or user acceptance.
 
 Windowed requests accept an explicit placement or restore the saved placement.
+Each fullscreen entry from an observed windowed mode saves the current placement,
+including a retry after failed entry and subsequent window movement or resizing.
+Switching between fullscreen modes preserves that saved windowed placement.
 Implicit restoration from a previously maximized window preserves the backend's
 native normal-placement information. If a monitor disappeared, placement is
 adjusted against current monitor snapshots. The backend can subsequently adjust

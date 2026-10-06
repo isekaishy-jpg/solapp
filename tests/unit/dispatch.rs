@@ -383,3 +383,64 @@ fn removed_current_record_reanchors_to_remaining_visited_ordinary_records() {
     // New high40 is before the surviving visited30 anchor; middle20 is after
     // that anchor's marker and is admitted into this same outer traversal.
 }
+
+#[test]
+fn failed_subscription_order_admission_leaves_candidate_reusable_and_existing_order_live() {
+    let mut core = Core::<App>::new().unwrap();
+    let mut cx = SAContext::new(&mut core, BackendOps::Unavailable, SAContextPhase::Event);
+    let recipient = cx.create_recipient().unwrap();
+    for _ in 0..3 {
+        cx.core.dispatch.fail_next_order_reservation = true;
+        assert_eq!(
+            cx.subscribe(
+                recipient,
+                SAEventFilter::Local,
+                SAPriority::default(),
+                first
+            ),
+            Err(SAError::AllocationFailed)
+        );
+    }
+    let old = cx
+        .subscribe(
+            recipient,
+            SAEventFilter::Local,
+            SAPriority::default(),
+            first,
+        )
+        .unwrap();
+    assert_eq!(old.key.index, 0);
+    assert_eq!(old.key.generation, 1);
+    cx.subscribe(
+        recipient,
+        SAEventFilter::Local,
+        SAPriority::new(10.0).unwrap(),
+        second,
+    )
+    .unwrap();
+    cx.unsubscribe(old).unwrap();
+    cx.core.dispatch.fail_next_order_reservation = true;
+    assert_eq!(
+        cx.subscribe(
+            recipient,
+            SAEventFilter::Local,
+            SAPriority::new(500.0).unwrap(),
+            first
+        ),
+        Err(SAError::AllocationFailed)
+    );
+    let replacement = cx
+        .subscribe(
+            recipient,
+            SAEventFilter::Local,
+            SAPriority::default(),
+            third,
+        )
+        .unwrap();
+    assert_eq!(replacement.key.index, old.key.index);
+    assert_eq!(replacement.key.generation, old.key.generation + 1);
+    assert_eq!(cx.unsubscribe(old), Err(SAError::StaleIdentity));
+    let mut app = App::new(Action::None);
+    cx.dispatch_local(&mut app, &0).unwrap();
+    assert_eq!(app.trace, [2, 3]);
+}

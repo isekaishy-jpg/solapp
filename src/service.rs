@@ -194,6 +194,8 @@ pub(crate) struct Services {
     order: Vec<SlotKey>,
     cursor: usize,
     pub(crate) depth: usize,
+    #[cfg(test)]
+    query_visits: std::cell::Cell<usize>,
 }
 impl Services {
     pub(crate) fn new() -> Self {
@@ -202,6 +204,8 @@ impl Services {
             order: Vec::new(),
             cursor: 0,
             depth: 0,
+            #[cfg(test)]
+            query_visits: std::cell::Cell::new(0),
         }
     }
     pub(crate) fn register(
@@ -345,18 +349,22 @@ impl Services {
         }
         Ok(())
     }
+    fn occupied(&self) -> impl Iterator<Item = &Service> {
+        self.order.iter().map(|key| {
+            #[cfg(test)]
+            self.query_visits.set(self.query_visits.get() + 1);
+            self.records
+                .get(*key)
+                .expect("ordered service remains occupied until reclaim")
+        })
+    }
     pub(crate) fn pending(&self, point: SAServicePoint, raw: SARawTime) -> bool {
-        self.records
-            .iter()
-            .any(|(_, record)| Self::due(record, point, raw))
+        self.occupied().any(|record| Self::due(record, point, raw))
     }
     pub(crate) fn deadline(&self, point: SAServicePoint, raw: SARawTime) -> Option<SARawDeadline> {
-        self.records
-            .iter()
-            .filter(|(_, record)| {
-                record.alive && !record.active && record.spec.points.contains(point)
-            })
-            .map(|(_, record)| {
+        self.occupied()
+            .filter(|record| record.alive && !record.active && record.spec.points.contains(point))
+            .map(|record| {
                 if record.wake.pending() {
                     SARawDeadline(raw)
                 } else {
@@ -366,19 +374,16 @@ impl Services {
             .min_by_key(|deadline| deadline.time().elapsed)
     }
     pub(crate) fn counts(&self) -> (usize, usize) {
-        let active = self
-            .records
-            .iter()
-            .filter(|(_, record)| record.active)
-            .count();
-        let retirement = self
-            .records
-            .iter()
-            .filter(|(_, record)| {
-                record.alive && record.spec.points.contains(SAServicePoint::Retirement)
+        self.occupied()
+            .fold((0, 0), |(active, retirement), record| {
+                (
+                    active + usize::from(record.active),
+                    retirement
+                        + usize::from(
+                            record.alive && record.spec.points.contains(SAServicePoint::Retirement),
+                        ),
+                )
             })
-            .count();
-        (active, retirement)
     }
     pub(crate) fn close_all(&mut self) {
         for key in &self.order {
@@ -389,3 +394,7 @@ impl Services {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/service_queries.rs"]
+mod query_tests;

@@ -38,6 +38,12 @@ request; success returns a transferable `SAShellReceipt` with a stable host-tagg
 identity. Capacity includes executing requests until the native call and request
 reclamation finish.
 
+Destination validation happens before helper capacity admission. A full helper
+rejects without allocating native destination storage; `CapacityFull` can therefore
+precede an allocation failure that would occur while preparing that destination.
+Accepted requests retain their prepared destination through the native call and
+release it with the original request before publishing terminal completion.
+
 `receipt.cancel()` succeeds only before the helper claims the request. Success
 prevents launch; the receipt becomes `Cancelled` after reclamation. Cancellation
 cannot undo a claimed launch. A terminal `Complete` result reports native

@@ -1,6 +1,8 @@
 //! Bounded owned cross-thread intake. Queue admission and close share one lock.
 
 use std::collections::{HashSet, VecDeque};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -102,6 +104,26 @@ pub(crate) struct Post<M> {
     pub(crate) message: M,
     pub(crate) receipt: SAPostReceipt,
 }
+// Detached ownership is independent of shared transport storage, including the
+// common singleton frontier. Iteration never consults the transport queue.
+pub(crate) enum Batch<M> {
+    Empty,
+    One(Post<M>),
+    Many(VecDeque<Post<M>>),
+}
+impl<M> Iterator for Batch<M> {
+    type Item = Post<M>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Empty => None,
+            Self::One(_) => match std::mem::replace(self, Self::Empty) {
+                Self::One(post) => Some(post),
+                _ => unreachable!(),
+            },
+            Self::Many(posts) => posts.pop_front(),
+        }
+    }
+}
 struct State<M> {
     open: bool,
     capacity: usize,
@@ -114,6 +136,8 @@ pub(crate) struct Transport<M> {
     next: AtomicU64,
     state: Mutex<State<M>>,
     wake: crate::backend::wake::NativeWake,
+    #[cfg(test)]
+    pub(crate) fail_next_batch_reservation: AtomicBool,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -143,6 +167,8 @@ impl<M: Send + 'static> Transport<M> {
                 queue,
             }),
             wake,
+            #[cfg(test)]
+            fail_next_batch_reservation: AtomicBool::new(false),
         })
     }
     pub(crate) fn register(&self, recipient: SARecipientId) -> Result<(), SAError> {
@@ -220,8 +246,24 @@ impl<M: Send + 'static> Transport<M> {
     pub(crate) fn pop(&self) -> Option<Post<M>> {
         lock(&self.state).queue.pop_front()
     }
-    pub(crate) fn detach(&self, budget: usize) -> Result<VecDeque<Post<M>>, SAError> {
+    pub(crate) fn detach(&self, budget: usize) -> Result<Batch<M>, SAError> {
         let count = self.len().min(budget);
+        if count == 0 {
+            return Ok(Batch::Empty);
+        }
+        if count == 1 {
+            return Ok(match lock(&self.state).queue.pop_front() {
+                Some(post) => Batch::One(post),
+                None => Batch::Empty,
+            });
+        }
+        #[cfg(test)]
+        if self
+            .fail_next_batch_reservation
+            .swap(false, Ordering::Relaxed)
+        {
+            return Err(SAError::AllocationFailed);
+        }
         let mut batch = VecDeque::new();
         batch
             .try_reserve(count)
@@ -232,7 +274,7 @@ impl<M: Send + 'static> Transport<M> {
                 batch.push_back(post);
             }
         }
-        Ok(batch)
+        Ok(Batch::Many(batch))
     }
     pub(crate) fn settled(&self) {
         let mut state = lock(&self.state);

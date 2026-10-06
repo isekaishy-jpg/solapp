@@ -56,24 +56,32 @@ pub struct SAPostId {
 pub(crate) struct Arena<T> {
     entries: Vec<Slot<T>>,
     kind: SAIdentityKind,
+    free_head: Option<u32>,
+    #[cfg(test)]
+    selection_steps: usize,
 }
 impl<T> Arena<T> {
     pub(crate) fn new(kind: SAIdentityKind) -> Self {
         Self {
             entries: Vec::new(),
             kind,
+            free_head: None,
+            #[cfg(test)]
+            selection_steps: 0,
         }
     }
     pub(crate) fn reserve(&mut self) -> Result<SlotKey, SAError> {
-        for (index, entry) in self.entries.iter().enumerate() {
-            if entry.value.is_none()
-                && let Some(generation) = entry.incarnation
-            {
-                return Ok(SlotKey {
-                    index: index as u32,
-                    generation,
-                });
-            }
+        // The candidate remains available until insert commits it. Companion
+        // reservations may fail without needing a separate rollback operation.
+        #[cfg(test)]
+        {
+            self.selection_steps += 1;
+        }
+        if let Some(index) = self.free_head {
+            return Ok(SlotKey {
+                index,
+                generation: self.entries[index as usize].incarnation.unwrap(),
+            });
         }
         let index =
             u32::try_from(self.entries.len()).map_err(|_| SAError::IdentityExhausted(self.kind))?;
@@ -83,14 +91,25 @@ impl<T> Arena<T> {
         self.entries.push(Slot {
             incarnation: Some(1),
             value: None,
+            next_free: self.free_head,
         });
+        self.free_head = Some(index);
         Ok(SlotKey {
             index,
             generation: 1,
         })
     }
     pub(crate) fn insert(&mut self, key: SlotKey, value: T) {
-        self.entries[key.index as usize].value = Some(value);
+        assert_eq!(
+            self.free_head,
+            Some(key.index),
+            "insert commits the current candidate"
+        );
+        let slot = &mut self.entries[key.index as usize];
+        assert_eq!(slot.incarnation, Some(key.generation));
+        assert!(slot.value.is_none());
+        self.free_head = slot.next_free.take();
+        slot.value = Some(value);
     }
     pub(crate) fn get(&self, key: SlotKey) -> Option<&T> {
         self.entries
@@ -115,6 +134,10 @@ impl<T> Arena<T> {
         slot.incarnation = slot
             .incarnation
             .and_then(|generation| generation.checked_add(1));
+        if slot.incarnation.is_some() {
+            slot.next_free = self.free_head;
+            self.free_head = Some(key.index);
+        }
         Some(value)
     }
     pub(crate) fn iter(&self) -> impl Iterator<Item = (SlotKey, &T)> {
@@ -182,6 +205,7 @@ pub struct SAWindowTarget {
 struct Slot<T> {
     incarnation: Option<u64>,
     value: Option<T>,
+    next_free: Option<u32>,
 }
 
 pub(crate) struct WindowSlots<T> {

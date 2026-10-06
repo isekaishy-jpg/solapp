@@ -43,8 +43,7 @@ pub struct SAShellRequest {
 }
 
 impl SAShellRequest {
-    pub(crate) fn wide(&self) -> Result<Vec<u16>, SAShellFailure> {
-        let mut wide = Vec::new();
+    fn validate(&self) -> Result<(), SAShellFailure> {
         match &self.destination {
             SAShellDestination::Url(url) => {
                 if url.is_empty() || url.contains('\0') {
@@ -65,34 +64,76 @@ impl SAShellRequest {
                 {
                     return Err(SAShellFailure::InvalidInput("invalid URL scheme"));
                 }
-                wide.try_reserve(
-                    url.len()
-                        .checked_add(1)
-                        .ok_or(SAShellFailure::AllocationFailed)?,
-                )
-                .map_err(|_| SAShellFailure::AllocationFailed)?;
-                wide.extend(url.encode_utf16());
             }
             SAShellDestination::File(path) => {
                 if !path.is_absolute() {
                     return Err(SAShellFailure::InvalidInput("file path must be absolute"));
                 }
-                let count = path.as_os_str().encode_wide().count();
-                wide.try_reserve(
-                    count
-                        .checked_add(1)
-                        .ok_or(SAShellFailure::AllocationFailed)?,
-                )
-                .map_err(|_| SAShellFailure::AllocationFailed)?;
-                wide.extend(path.as_os_str().encode_wide());
-                if wide.contains(&0) {
+                if path.as_os_str().encode_wide().any(|unit| unit == 0) {
                     return Err(SAShellFailure::InvalidInput("file path contains NUL"));
                 }
             }
         }
-        wide.push(0);
-        Ok(wide)
+        Ok(())
     }
+
+    fn prepare(&self) -> Result<PreparedDestination, SAShellFailure> {
+        self.validate()?;
+        #[cfg(test)]
+        PREPARATIONS.with(|count| count.set(count.get() + 1));
+        #[cfg(test)]
+        if FAIL_NEXT_PREPARATION.with(|fail| fail.replace(false)) {
+            return Err(SAShellFailure::AllocationFailed);
+        }
+        let count = match &self.destination {
+            SAShellDestination::Url(url) => url.encode_utf16().count(),
+            SAShellDestination::File(path) => path.as_os_str().encode_wide().count(),
+        };
+        let mut wide = Vec::new();
+        wide.try_reserve_exact(
+            count
+                .checked_add(1)
+                .ok_or(SAShellFailure::AllocationFailed)?,
+        )
+        .map_err(|_| SAShellFailure::AllocationFailed)?;
+        match &self.destination {
+            SAShellDestination::Url(url) => wide.extend(url.encode_utf16()),
+            SAShellDestination::File(path) => wide.extend(path.as_os_str().encode_wide()),
+        }
+        wide.push(0);
+        Ok(PreparedDestination { wide })
+    }
+}
+
+// Only validated preparation constructs this private terminated native buffer.
+pub(crate) struct PreparedDestination {
+    wide: Vec<u16>,
+}
+impl PreparedDestination {
+    pub(crate) fn wide(&self) -> &[u16] {
+        &self.wide
+    }
+}
+struct PreparedRequest {
+    request: SAShellRequest,
+    destination: PreparedDestination,
+}
+impl PreparedRequest {
+    fn reject(self, reason: SAShellFailure) -> SAShellRejected {
+        // Dispose of private backing outside the transport lock and preserve
+        // exactly the original public request.
+        let Self {
+            request,
+            destination,
+        } = self;
+        drop(destination);
+        SAShellRejected { request, reason }
+    }
+}
+#[cfg(test)]
+thread_local! {
+    static PREPARATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FAIL_NEXT_PREPARATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Operation failure, independent of whether a launched process later exits.
@@ -206,7 +247,7 @@ impl SAShellReceipt {
 }
 
 struct Pending {
-    request: SAShellRequest,
+    request: PreparedRequest,
     receipt: SAShellReceipt,
 }
 struct State {
@@ -217,6 +258,17 @@ struct State {
     accepted: usize,
     queue: VecDeque<Pending>,
     done: bool,
+}
+impl State {
+    fn admission_failure(&self) -> Option<SAShellFailure> {
+        if !self.open {
+            Some(SAShellFailure::Closed)
+        } else if self.accepted >= self.capacity {
+            Some(SAShellFailure::CapacityFull)
+        } else {
+            None
+        }
+    }
 }
 struct Shared {
     state: Mutex<State>,
@@ -240,8 +292,8 @@ impl ShellHelper {
     pub(crate) fn new(host: crate::SAHostId, capacity: usize) -> Result<Self, SAShellFailure> {
         Self::spawn(host, capacity, || {
             let apartment = crate::backend::windows::shell::Apartment::new();
-            move |request: &SAShellRequest| match &apartment {
-                Ok(apartment) => apartment.launch(request),
+            move |request: &PreparedRequest| match &apartment {
+                Ok(apartment) => apartment.launch(&request.destination),
                 Err(error) => Err(error.clone()),
             }
         })
@@ -254,7 +306,7 @@ impl ShellHelper {
     ) -> Result<Self, SAShellFailure>
     where
         Init: FnOnce() -> Execute + Send + 'static,
-        Execute: FnMut(&SAShellRequest) -> Result<(), SAShellFailure>,
+        Execute: FnMut(&PreparedRequest) -> Result<(), SAShellFailure>,
     {
         if capacity == 0 {
             return Err(SAShellFailure::InvalidInput(
@@ -344,26 +396,35 @@ impl ShellHelper {
         &self,
         request: SAShellRequest,
     ) -> Result<SAShellReceipt, SAShellRejected> {
-        if let Err(reason) = request.wide() {
+        if let Err(reason) = request.validate() {
             return Err(SAShellRejected { request, reason });
         }
-        let mut state = lock(&self.shared.state);
-        let reason = if !state.open {
-            Some(SAShellFailure::Closed)
-        } else if state.accepted >= state.capacity {
-            Some(SAShellFailure::CapacityFull)
-        } else {
-            None
-        };
-        if let Some(reason) = reason {
-            drop(state);
+        // This is advisory only: it publishes no receipt or reservation. Full
+        // helpers reject before private encoding, so CapacityFull can precede
+        // an incidental AllocationFailed that preparation once exposed.
+        if let Some(reason) = lock(&self.shared.state).admission_failure() {
             return Err(SAShellRejected { request, reason });
+        }
+        let destination = match request.prepare() {
+            Ok(destination) => destination,
+            Err(reason) => return Err(SAShellRejected { request, reason }),
+        };
+        let prepared = PreparedRequest {
+            request,
+            destination,
+        };
+        self.admit(prepared)
+    }
+
+    fn admit(&self, prepared: PreparedRequest) -> Result<SAShellReceipt, SAShellRejected> {
+        let mut state = lock(&self.shared.state);
+        if let Some(reason) = state.admission_failure() {
+            drop(state);
+            return Err(prepared.reject(reason));
         }
         let Some(serial) = state.serial.checked_add(1) else {
-            return Err(SAShellRejected {
-                request,
-                reason: SAShellFailure::IdentityExhausted,
-            });
+            drop(state);
+            return Err(prepared.reject(SAShellFailure::IdentityExhausted));
         };
         let receipt = SAShellReceipt {
             id: SAShellRequestId {
@@ -378,7 +439,7 @@ impl ShellHelper {
         };
         state.serial = serial;
         state.queue.push_back(Pending {
-            request,
+            request: prepared,
             receipt: receipt.clone(),
         });
         state.accepted += 1;
@@ -448,7 +509,7 @@ mod tests {
 
     #[test]
     fn encoding_preserves_destination_and_rejects_ambiguous_input() {
-        let encoded = request().wide().unwrap();
+        let encoded = request().prepare().unwrap().wide;
         assert_eq!(
             String::from_utf16(&encoded[..encoded.len() - 1]).unwrap(),
             "https://example.invalid/a%20b"
@@ -458,7 +519,7 @@ mod tests {
                 SAShellRequest {
                     destination: SAShellDestination::Url(url.into())
                 }
-                .wide()
+                .prepare()
                 .is_err()
             );
         }
@@ -466,7 +527,7 @@ mod tests {
             SAShellRequest {
                 destination: SAShellDestination::File(PathBuf::from("relative.txt"))
             }
-            .wide()
+            .prepare()
             .is_err()
         );
         use std::os::windows::ffi::OsStringExt;
@@ -475,8 +536,9 @@ mod tests {
             SAShellRequest {
                 destination: SAShellDestination::File(native.into())
             }
-            .wide()
-            .unwrap(),
+            .prepare()
+            .unwrap()
+            .wide,
             [67, 58, 92, 0xd800, 0]
         );
     }
@@ -486,7 +548,7 @@ mod tests {
         let (started, observed) = mpsc::channel();
         let (release, released) = mpsc::channel();
         let mut helper = ShellHelper::spawn(crate::SAHostId::allocate().unwrap(), 2, move || {
-            move |_: &SAShellRequest| {
+            move |_: &PreparedRequest| {
                 started.send(()).unwrap();
                 released.recv_timeout(Duration::from_secs(2)).unwrap();
                 Ok(())
@@ -525,7 +587,9 @@ mod tests {
     #[test]
     fn helper_fault_settles_receipt_without_losing_retirement() {
         let mut helper = ShellHelper::spawn(crate::SAHostId::allocate().unwrap(), 1, || {
-            |_: &SAShellRequest| -> Result<(), SAShellFailure> { panic!("injected executor fault") }
+            |_: &PreparedRequest| -> Result<(), SAShellFailure> {
+                panic!("injected executor fault")
+            }
         })
         .unwrap();
         let receipt = helper.try_launch(request()).unwrap();
@@ -550,7 +614,7 @@ mod tests {
     #[test]
     fn exhausted_identity_rejects_original_owned_request() {
         let host = crate::SAHostId::allocate().unwrap();
-        let mut helper = ShellHelper::spawn(host, 1, || |_: &SAShellRequest| Ok(())).unwrap();
+        let mut helper = ShellHelper::spawn(host, 1, || |_: &PreparedRequest| Ok(())).unwrap();
         lock(&helper.shared.state).serial = u64::MAX;
         let original = request();
         let rejected = helper.try_launch(original.clone()).unwrap_err();
@@ -569,7 +633,7 @@ mod tests {
         };
         let expected = failure.clone();
         let mut helper = ShellHelper::spawn(crate::SAHostId::allocate().unwrap(), 2, move || {
-            move |_: &SAShellRequest| Err(failure.clone())
+            move |_: &PreparedRequest| Err(failure.clone())
         })
         .unwrap();
         let first = helper.try_launch(request()).unwrap();
@@ -581,6 +645,230 @@ mod tests {
                 SAShellOutcome::Complete(Err(expected.clone()))
             );
         }
+        assert_eq!(helper.pending(), 0);
+    }
+
+    #[test]
+    fn validation_has_no_allocations_and_preparation_preserves_native_units() {
+        use std::os::windows::ffi::OsStringExt;
+        let cases = [
+            SAShellRequest {
+                destination: SAShellDestination::Url("custom+thing:é/漢/%20?q=🙂".into()),
+            },
+            SAShellRequest {
+                destination: SAShellDestination::File(PathBuf::from(r"C:\absolute\é.txt")),
+            },
+            SAShellRequest {
+                destination: SAShellDestination::File(
+                    std::ffi::OsString::from_wide(&[67, 58, 92, 0xd800]).into(),
+                ),
+            },
+        ];
+        for request in cases {
+            PREPARATIONS.with(|count| count.set(0));
+            let (valid, counts) = crate::allocation_probe::measure(|| request.validate());
+            assert_eq!(valid, Ok(()));
+            assert_eq!(counts.allocations, 0);
+            assert_eq!(counts.reallocations, 0);
+            assert_eq!(PREPARATIONS.with(|count| count.get()), 0);
+            let (prepared, counts) =
+                crate::allocation_probe::measure(|| request.prepare().unwrap());
+            let expected: Vec<_> = match &request.destination {
+                SAShellDestination::Url(url) => url.encode_utf16().chain(Some(0)).collect(),
+                SAShellDestination::File(path) => {
+                    path.as_os_str().encode_wide().chain(Some(0)).collect()
+                }
+            };
+            assert_eq!(prepared.wide(), expected);
+            assert_eq!(counts.allocations, 1);
+            assert_eq!(counts.reallocations, 0);
+            assert_eq!(PREPARATIONS.with(|count| count.get()), 1);
+            println!(
+                "shell validation allocations=0 preparation allocations={} preparations=1 units={}",
+                counts.allocations,
+                expected.len()
+            );
+        }
+        let invalid = SAShellRequest {
+            destination: SAShellDestination::File(
+                std::ffi::OsString::from_wide(&[67, 58, 92, 0xd800, 0]).into(),
+            ),
+        };
+        let (result, counts) = crate::allocation_probe::measure(|| invalid.validate());
+        assert_eq!(
+            result,
+            Err(SAShellFailure::InvalidInput("file path contains NUL"))
+        );
+        assert_eq!(counts.allocations, 0);
+    }
+
+    #[test]
+    fn helper_encodes_accepted_requests_once_and_rejects_full_or_invalid_before_preparation() {
+        let (entered, observed) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let mut helper = ShellHelper::spawn(crate::SAHostId::allocate().unwrap(), 1, move || {
+            move |prepared: &PreparedRequest| {
+                assert_eq!(prepared.request, request());
+                assert_eq!(
+                    String::from_utf16(
+                        &prepared.destination.wide()[..prepared.destination.wide().len() - 1]
+                    )
+                    .unwrap(),
+                    "https://example.invalid/a%20b"
+                );
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(3)).unwrap();
+                Ok(())
+            }
+        })
+        .unwrap();
+        let accepted = request();
+        PREPARATIONS.with(|count| count.set(0));
+        let (receipt, counts) =
+            crate::allocation_probe::measure(|| helper.try_launch(accepted).unwrap());
+        assert_eq!(PREPARATIONS.with(|count| count.get()), 1);
+        assert_eq!(
+            counts.allocations, 2,
+            "one destination backing plus one receipt"
+        );
+        assert_eq!(counts.reallocations, 0);
+        observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        println!(
+            "shell accepted preparations=1 admission allocations={} (buffer+receipt)",
+            counts.allocations
+        );
+        let original = request();
+        PREPARATIONS.with(|count| count.set(0));
+        FAIL_NEXT_PREPARATION.with(|fail| fail.set(true));
+        let submitted = original.clone();
+        let (rejected, counts) =
+            crate::allocation_probe::measure(|| helper.try_launch(submitted).unwrap_err());
+        assert_eq!(rejected.request, original);
+        assert_eq!(rejected.reason, SAShellFailure::CapacityFull);
+        assert_eq!(PREPARATIONS.with(|count| count.get()), 0);
+        assert!(FAIL_NEXT_PREPARATION.with(|fail| fail.get()));
+        assert_eq!(counts.allocations, 0);
+        assert_eq!(counts.reallocations, 0);
+        let invalid = SAShellRequest {
+            destination: SAShellDestination::Url("relative/path".into()),
+        };
+        let submitted = invalid.clone();
+        let (rejected, counts) =
+            crate::allocation_probe::measure(|| helper.try_launch(submitted).unwrap_err());
+        assert_eq!(counts.allocations, 0);
+        assert_eq!(counts.reallocations, 0);
+        assert_eq!(rejected.request, invalid);
+        assert!(matches!(rejected.reason, SAShellFailure::InvalidInput(_)));
+        assert_eq!(PREPARATIONS.with(|count| count.get()), 0);
+        helper.close();
+        let submitted = original.clone();
+        let (rejected, counts) =
+            crate::allocation_probe::measure(|| helper.try_launch(submitted).unwrap_err());
+        assert_eq!(counts.allocations, 0);
+        assert_eq!(counts.reallocations, 0);
+        assert_eq!(rejected.request, original);
+        assert_eq!(rejected.reason, SAShellFailure::Closed);
+        assert_eq!(PREPARATIONS.with(|count| count.get()), 0);
+        FAIL_NEXT_PREPARATION.with(|fail| fail.set(false));
+        println!(
+            "shell already-full/invalid/closed preparations=0 allocations=0 (CapacityFull precedes injected preparation failure)"
+        );
+        release.send(()).unwrap();
+        retire(&mut helper);
+        assert_eq!(receipt.outcome(), SAShellOutcome::Complete(Ok(())));
+    }
+
+    #[test]
+    fn preparation_failure_returns_original_without_receipt_identity_or_queue_commit() {
+        let mut helper = ShellHelper::spawn(crate::SAHostId::allocate().unwrap(), 1, || {
+            |_: &PreparedRequest| Ok(())
+        })
+        .unwrap();
+        let original = request();
+        FAIL_NEXT_PREPARATION.with(|fail| fail.set(true));
+        let rejected = helper.try_launch(original.clone()).unwrap_err();
+        assert_eq!(rejected.request, original);
+        assert_eq!(rejected.reason, SAShellFailure::AllocationFailed);
+        let state = lock(&helper.shared.state);
+        assert_eq!(state.serial, 0);
+        assert_eq!(state.accepted, 0);
+        assert!(state.queue.is_empty());
+        drop(state);
+        let receipt = helper.try_launch(original).unwrap();
+        assert_eq!(receipt.id.serial, 1);
+        retire(&mut helper);
+        assert_eq!(receipt.outcome(), SAShellOutcome::Complete(Ok(())));
+    }
+
+    #[test]
+    fn final_admission_rechecks_open_capacity_and_identity_after_outside_lock_preparation() {
+        let original = request();
+        for reason in [
+            SAShellFailure::Closed,
+            SAShellFailure::CapacityFull,
+            SAShellFailure::IdentityExhausted,
+        ] {
+            // A closed helper is never reopened: its waiting thread may already
+            // have observed closure, including after a spurious condvar wake.
+            let mut helper = ShellHelper::spawn(crate::SAHostId::allocate().unwrap(), 1, || {
+                |_: &PreparedRequest| Ok(())
+            })
+            .unwrap();
+            assert_eq!(lock(&helper.shared.state).admission_failure(), None);
+            let prepared = PreparedRequest {
+                request: original.clone(),
+                destination: original.prepare().unwrap(),
+            };
+            {
+                let mut state = lock(&helper.shared.state);
+                match reason {
+                    SAShellFailure::Closed => state.open = false,
+                    SAShellFailure::CapacityFull => state.accepted = state.capacity,
+                    SAShellFailure::IdentityExhausted => state.serial = u64::MAX,
+                    _ => unreachable!(),
+                }
+            }
+            let (rejected, counts) =
+                crate::allocation_probe::measure(|| helper.admit(prepared).unwrap_err());
+            assert_eq!(rejected.request, original);
+            assert_eq!(rejected.reason, reason);
+            assert_eq!(counts.allocations, 0);
+            assert_eq!(
+                counts.deallocations, 1,
+                "private encoded backing disposed, original request retained"
+            );
+            {
+                let mut state = lock(&helper.shared.state);
+                assert!(state.queue.is_empty());
+                // Clear only the fixture's synthetic accepted count.
+                state.accepted = 0;
+            }
+            retire(&mut helper);
+        }
+        let mut helper = ShellHelper::spawn(crate::SAHostId::allocate().unwrap(), 1, || {
+            |_: &PreparedRequest| Ok(())
+        })
+        .unwrap();
+        let receipt = helper.try_launch(original).unwrap();
+        assert_eq!(receipt.id.serial, 1);
+        retire(&mut helper);
+        assert_eq!(receipt.outcome(), SAShellOutcome::Complete(Ok(())));
+    }
+
+    #[test]
+    fn helper_init_panic_still_settles_accepted_owned_preparation_and_retires() {
+        let mut helper = ShellHelper::spawn(crate::SAHostId::allocate().unwrap(), 1, || {
+            panic!("injected helper init panic");
+            #[allow(unreachable_code)]
+            |_: &PreparedRequest| Ok(())
+        })
+        .unwrap();
+        let receipt = helper.try_launch(request()).unwrap();
+        retire(&mut helper);
+        assert_eq!(
+            receipt.outcome(),
+            SAShellOutcome::Complete(Err(SAShellFailure::HelperPanicked))
+        );
         assert_eq!(helper.pending(), 0);
     }
 }

@@ -294,3 +294,54 @@ fn arbitrary_cancellation_preserves_heap_and_reused_tokens_and_foreign_deadlines
         [1, 3, 5, 7, 9]
     );
 }
+
+#[test]
+fn failed_heap_admission_preserves_original_payload_and_reusable_candidate_without_heap_changes() {
+    let mut core = Core::<App>::new().unwrap();
+    core.clock.manual = Some(Duration::ZERO);
+    let mut cx = SAContext::new(&mut core, BackendOps::Unavailable, SAContextPhase::Event);
+    let recipient = cx.create_recipient().unwrap();
+    cx.subscribe(
+        recipient,
+        SAEventFilter::Timer,
+        SAPriority::default(),
+        handler,
+    )
+    .unwrap();
+    let due = cx.clock().raw.checked_add(Duration::ZERO).unwrap();
+    for _ in 0..3 {
+        cx.core.timers.fail_next_heap_reservation = true;
+        let (returned, error) = cx
+            .schedule_timer(recipient, due, 42)
+            .unwrap_err()
+            .into_parts();
+        assert_eq!((returned, error), (42, SAError::AllocationFailed));
+        assert_eq!(cx.core.timers.counts(), (0, 0));
+    }
+    let old = cx.schedule_timer(recipient, due, 1).unwrap();
+    assert_eq!(old.key.index, 0);
+    assert_eq!(old.key.generation, 1);
+    assert!(matches!(
+        cx.cancel_timer(old),
+        Ok(SATimerCancel::Removed(1))
+    ));
+    cx.core.timers.fail_next_heap_reservation = true;
+    assert_eq!(
+        cx.schedule_timer(recipient, due, 99).unwrap_err().input(),
+        &99
+    );
+    let replacement = cx.schedule_timer(recipient, due, 2).unwrap();
+    assert_eq!(replacement.key.index, old.key.index);
+    assert_eq!(replacement.key.generation, old.key.generation + 1);
+    assert!(matches!(cx.cancel_timer(old), Ok(SATimerCancel::Stale)));
+    let mut app = App {
+        action: Action::Limit,
+        recipient: Some(recipient),
+        other: None,
+        trace: Vec::new(),
+    };
+    let report = cx.service_timers(&mut app, 8).unwrap();
+    assert_eq!(report.claimed, 1);
+    assert_eq!(app.trace, [(2, Duration::ZERO)]);
+    assert_eq!(cx.core.timers.counts(), (0, 0));
+}

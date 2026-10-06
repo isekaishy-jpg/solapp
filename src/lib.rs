@@ -137,3 +137,7 @@ mod shutdown_tests;
 #[cfg(test)]
 #[path = "../tests/unit/workloads.rs"]
 mod workload_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/allocation_probe.rs"]
+mod allocation_probe;

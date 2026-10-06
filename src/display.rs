@@ -603,7 +603,6 @@ impl DisplayState {
         let mut transition = self.pending.take()?;
         if self.observed.backend_mode == SADisplayMode::Windowed
             && transition.request.mode() != SADisplayMode::Windowed
-            && self.saved_windowed.is_none()
         {
             self.saved_windowed = self.observed.windowed_placement();
         }

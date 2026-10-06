@@ -18,3 +18,7 @@ solworker = { path = "../solworker", optional = true }
 [dev-dependencies]
 solcache = { path = "../solcache" }
 solworker = { path = "../solworker" }
+
+[[test]]
+name = "capture_transfer"
+harness = false

@@ -380,3 +380,113 @@ fn implicit_maximized_return_preserves_backend_normal_restore_rectangle() {
         Some(explicit)
     );
 }
+
+#[test]
+fn failed_fullscreen_entries_refresh_restore_from_each_observed_windowed_start() {
+    for mode in [SADisplayMode::Borderless, SADisplayMode::Exclusive] {
+        for maximized in [false, true] {
+            let target = target();
+            let host = target.id.host();
+            let mut state = DisplayState::new(target, observed(SADisplayMode::Windowed));
+            for attempt in 0..3 {
+                let failed = state.request(request(mode, host)).unwrap().receipt;
+                state.start_next().unwrap();
+                state
+                    .fail(failed, SAError::application("failed native entry"))
+                    .unwrap();
+                let mut moved = observed(SADisplayMode::Windowed);
+                moved.geometry.position = Some(SAScreenPosition {
+                    x: 150 + attempt * 20,
+                    y: 100,
+                });
+                moved.geometry.size = SAPhysicalSize {
+                    width: 900,
+                    height: 700,
+                };
+                moved.geometry.maximized = maximized;
+                state.observe(moved);
+            }
+            let newer = state.observed().windowed_placement().unwrap();
+            // Superseding an unstarted request must not snapshot that request.
+            let superseded = state.request(request(mode, host)).unwrap().receipt;
+            let entry = state.request(request(mode, host)).unwrap();
+            assert_eq!(entry.superseded.unwrap().receipt, superseded);
+            state.start_next().unwrap();
+            assert_eq!(state.saved_windowed, Some(newer));
+            state.applied(entry.receipt, observed(mode)).unwrap();
+            state
+                .report(entry.receipt, SAPresentationStatus::Ready)
+                .unwrap();
+            let other = if mode == SADisplayMode::Borderless {
+                SADisplayMode::Exclusive
+            } else {
+                SADisplayMode::Borderless
+            };
+            let switching = state.request(request(other, host)).unwrap().receipt;
+            state.start_next().unwrap();
+            assert_eq!(state.saved_windowed, Some(newer));
+            state.applied(switching, observed(other)).unwrap();
+            state
+                .report(switching, SAPresentationStatus::Ready)
+                .unwrap();
+            state
+                .request(request(SADisplayMode::Windowed, host))
+                .unwrap();
+            assert_eq!(
+                state.start_next().unwrap().windowed_placement,
+                (!maximized).then_some(newer)
+            );
+        }
+    }
+}
+
+#[test]
+fn failure_after_native_fullscreen_entry_preserves_restore_and_explicit_precedence() {
+    for mode in [SADisplayMode::Borderless, SADisplayMode::Exclusive] {
+        let target = target();
+        let host = target.id.host();
+        let mut state = DisplayState::new(target, observed(SADisplayMode::Windowed));
+        let entry = state.request(request(mode, host)).unwrap().receipt;
+        state.start_next().unwrap();
+        state.applied(entry, observed(mode)).unwrap();
+        state
+            .report(
+                entry,
+                SAPresentationStatus::Failed(SAError::application("SR failed after native entry")),
+            )
+            .unwrap();
+        assert_eq!(state.observed().backend_mode, mode);
+        assert_eq!(state.saved_windowed, Some(placement()));
+        state.request(request(mode, host)).unwrap();
+        let retry = state.start_next().unwrap().transition.receipt;
+        assert_eq!(state.saved_windowed, Some(placement()));
+        // A native failure observed while already fullscreen also retains restore state.
+        state
+            .fail(retry, SAError::application("native retry failed"))
+            .unwrap();
+        state
+            .request(request(SADisplayMode::Windowed, host))
+            .unwrap();
+        let restore = state.start_next().unwrap();
+        assert_eq!(restore.windowed_placement, Some(placement()));
+        state
+            .fail(
+                restore.transition.receipt,
+                SAError::application("restore failed"),
+            )
+            .unwrap();
+        let explicit = SAWindowedPlacement {
+            position: SAScreenPosition { x: 42, y: 70 },
+            ..placement()
+        };
+        state
+            .request(SADisplayRequest::Windowed {
+                placement: Some(explicit),
+            })
+            .unwrap();
+        assert_eq!(
+            state.start_next().unwrap().windowed_placement,
+            Some(explicit)
+        );
+    }
+}

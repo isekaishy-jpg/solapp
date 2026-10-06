@@ -435,3 +435,435 @@ fn focus_fallback_retains_last_observed_key_meaning_and_location() {
             .is_empty()
     );
 }
+
+#[test]
+fn output_backing_matches_complete_event_and_ignores_held_key_population() {
+    let target = target();
+    let mut adapter = NativeInputAdapter::new();
+    let mut text = TextState::new();
+    let held = SAInputState {
+        held_keys: (0..4096).map(SAPhysicalKey::ScanCode).collect(),
+        held_buttons: vec![SAMouseButton::Left, SAMouseButton::Right],
+        ..Default::default()
+    };
+    let pointer = WindowEvent::CursorMoved {
+        device_id: DeviceId::dummy(),
+        position: winit::dpi::PhysicalPosition::new(12.0, 24.0),
+    };
+    for state in [&SAInputState::default(), &held] {
+        let (batch, counts) = crate::allocation_probe::measure(|| {
+            translate(&mut adapter, target, &pointer, state, &mut text)
+        });
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.capacity(), 1);
+        assert_eq!(counts.allocations, 1);
+        assert_eq!(counts.reallocations, 0);
+        println!(
+            "input pointer held={} output={} capacity={} allocations={} reallocations={}",
+            state.held_keys.len(),
+            batch.len(),
+            batch.capacity(),
+            counts.allocations,
+            counts.reallocations
+        );
+    }
+    for event in [
+        WindowEvent::CloseRequested,
+        WindowEvent::CursorEntered {
+            device_id: DeviceId::dummy(),
+        },
+        WindowEvent::Ime(Ime::Preedit("unused".into(), None)),
+        WindowEvent::Ime(Ime::Commit("unused".into())),
+        WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state: ElementState::Released,
+            button: MouseButton::Middle,
+        },
+    ] {
+        let (batch, counts) = crate::allocation_probe::measure(|| {
+            translate(&mut adapter, target, &event, &held, &mut text)
+        });
+        assert_eq!(batch.capacity(), 0);
+        assert_eq!(counts.allocations, 0);
+        assert_eq!(counts.reallocations, 0);
+        println!(
+            "input ignored/inactive event={event:?} allocations={}",
+            counts.allocations
+        );
+    }
+    let focus = translate(
+        &mut adapter,
+        target,
+        &WindowEvent::Focused(false),
+        &held,
+        &mut text,
+    );
+    assert_eq!(focus.len(), 4099);
+    assert_eq!(focus.capacity(), 4099);
+    assert!(focus[..4096].iter().all(|record| matches!(
+        record.event,
+        SAInputEvent::Key {
+            state: SAButtonState::Released,
+            ..
+        }
+    ) && record.origin == SAInputOrigin::Reconciliation));
+    assert!(matches!(
+        focus[4096].event,
+        SAInputEvent::MouseButton {
+            button: SAMouseButton::Left,
+            ..
+        }
+    ));
+    assert!(matches!(
+        focus[4097].event,
+        SAInputEvent::MouseButton {
+            button: SAMouseButton::Right,
+            ..
+        }
+    ));
+    assert_eq!(focus[4098].event, SAInputEvent::Focus(false));
+    let capture = translate(
+        &mut adapter,
+        target,
+        &WindowEvent::MouseCaptureLost,
+        &held,
+        &mut text,
+    );
+    assert_eq!(capture.len(), 3);
+    assert_eq!(capture.capacity(), 3);
+    assert_eq!(capture[2].event, SAInputEvent::CaptureLost);
+}
+
+#[test]
+fn batch_reservation_failure_precedes_reconciliation_and_ime_mutation() {
+    let target = target();
+    let mut adapter = NativeInputAdapter::new();
+    let mut text = TextState::new();
+    begin(&mut text, target);
+    let pressed = adapter
+        .key_event(
+            target,
+            PhysicalKey::Code(KeyCode::ControlRight),
+            &Key::Named(NamedKey::Control),
+            KeyLocation::Right,
+            ElementState::Pressed,
+            false,
+            false,
+            None,
+            &SAInputState::default(),
+            &text,
+        )
+        .unwrap();
+    assert_eq!(pressed.len(), 1);
+    let state = SAInputState {
+        held_keys: vec![SAPhysicalKey::ScanCode(0xe01d)],
+        held_buttons: vec![SAMouseButton::Left, SAMouseButton::Right],
+        ..Default::default()
+    };
+    adapter.fail_next_batch_reservation.set(true);
+    let failed = adapter.window_event(
+        target,
+        &WindowEvent::Focused(false),
+        &state,
+        SAPhysicalSize {
+            width: 800,
+            height: 600,
+        },
+        1.5,
+        &mut text,
+    );
+    assert!(matches!(failed, Err(SAError::AllocationFailed)));
+    assert!(
+        adapter
+            .keys
+            .contains_key(&(target, SAPhysicalKey::ScanCode(0xe01d)))
+    );
+    assert_eq!(state.held_buttons.len(), 2);
+    let retry = translate(
+        &mut adapter,
+        target,
+        &WindowEvent::Focused(false),
+        &state,
+        &mut text,
+    );
+    assert_eq!(retry.len(), 4);
+    assert!(matches!(
+        retry[0].event,
+        SAInputEvent::Key {
+            logical: SALogicalKey::Named(SANamedKey::Control),
+            location: SAKeyLocation::Right,
+            ..
+        }
+    ));
+    assert!(adapter.keys.is_empty());
+    translate(
+        &mut adapter,
+        target,
+        &WindowEvent::Ime(Ime::Enabled),
+        &state,
+        &mut text,
+    );
+    adapter.fail_next_batch_reservation.set(true);
+    assert!(matches!(
+        adapter.window_event(
+            target,
+            &WindowEvent::Ime(Ime::Disabled),
+            &state,
+            SAPhysicalSize {
+                width: 1,
+                height: 1
+            },
+            1.0,
+            &mut text
+        ),
+        Err(SAError::AllocationFailed)
+    ));
+    assert!(text.composing(target));
+    let cleared = translate(
+        &mut adapter,
+        target,
+        &WindowEvent::Ime(Ime::Disabled),
+        &state,
+        &mut text,
+    );
+    assert_eq!(cleared.len(), 1);
+    assert!(!text.composing(target));
+}
+
+#[test]
+fn keyboard_backing_is_one_or_two_records_and_suppressed_release_has_none() {
+    let target = target();
+    let mut adapter = NativeInputAdapter::new();
+    let mut text = TextState::new();
+    begin(&mut text, target);
+    let state = SAInputState::default();
+    // Warm the key-meaning map before measuring only the normalizer allocations.
+    adapter
+        .key_event(
+            target,
+            PhysicalKey::Code(KeyCode::Enter),
+            &Key::Named(NamedKey::Enter),
+            KeyLocation::Standard,
+            ElementState::Pressed,
+            false,
+            false,
+            None,
+            &state,
+            &text,
+        )
+        .unwrap();
+    let (batch, counts) = crate::allocation_probe::measure(|| {
+        adapter
+            .key_event(
+                target,
+                PhysicalKey::Code(KeyCode::Enter),
+                &Key::Named(NamedKey::Enter),
+                KeyLocation::Standard,
+                ElementState::Pressed,
+                true,
+                false,
+                None,
+                &state,
+                &text,
+            )
+            .unwrap()
+    });
+    assert_eq!(batch.capacity(), 1);
+    assert_eq!(counts.allocations, 1);
+    assert_eq!(counts.reallocations, 0);
+    println!(
+        "input keyboard field boundary no-text allocations={} capacity={} (warm meaning map)",
+        counts.allocations,
+        batch.capacity()
+    );
+    let text_batch = adapter
+        .key_event(
+            target,
+            PhysicalKey::Code(KeyCode::Enter),
+            &Key::Named(NamedKey::Enter),
+            KeyLocation::Standard,
+            ElementState::Pressed,
+            false,
+            false,
+            Some("\r"),
+            &state,
+            &text,
+        )
+        .unwrap();
+    assert_eq!(text_batch.capacity(), 2);
+    assert_eq!(text_batch.len(), 2);
+    adapter.fail_next_batch_reservation.set(true);
+    let failed = adapter.key_event(
+        target,
+        PhysicalKey::Code(KeyCode::KeyA),
+        &Key::Character("a".into()),
+        KeyLocation::Standard,
+        ElementState::Pressed,
+        false,
+        false,
+        Some("a"),
+        &state,
+        &text,
+    );
+    assert!(matches!(failed, Err(SAError::AllocationFailed)));
+    assert!(
+        !adapter
+            .keys
+            .contains_key(&(target, SAPhysicalKey::ScanCode(0x1e)))
+    );
+    let (released, counts) = crate::allocation_probe::measure(|| {
+        adapter
+            .key_event(
+                target,
+                PhysicalKey::Code(KeyCode::Enter),
+                &Key::Named(NamedKey::Enter),
+                KeyLocation::Standard,
+                ElementState::Released,
+                false,
+                false,
+                None,
+                &state,
+                &text,
+            )
+            .unwrap()
+    });
+    assert_eq!(released.capacity(), 0);
+    assert_eq!(counts.allocations, 0);
+    assert!(adapter.keys.is_empty());
+    println!(
+        "input suppressed keyboard release allocations={} capacity={}",
+        counts.allocations,
+        released.capacity()
+    );
+}
+
+#[test]
+fn ime_without_session_changes_composition_without_output_and_geometry_remains_native() {
+    let target = target();
+    let mut adapter = NativeInputAdapter::new();
+    let mut text = TextState::new();
+    let state = SAInputState::default();
+    let enabled = translate(
+        &mut adapter,
+        target,
+        &WindowEvent::Ime(Ime::Enabled),
+        &state,
+        &mut text,
+    );
+    assert_eq!(enabled.capacity(), 0);
+    assert!(text.composing(target));
+    for ime in [
+        Ime::Preedit("x".into(), Some((0, 1))),
+        Ime::Commit("x".into()),
+        Ime::Disabled,
+    ] {
+        let (batch, counts) = crate::allocation_probe::measure(|| {
+            translate(
+                &mut adapter,
+                target,
+                &WindowEvent::Ime(ime),
+                &state,
+                &mut text,
+            )
+        });
+        assert_eq!(batch.capacity(), 0);
+        assert_eq!(counts.allocations, 0);
+    }
+    assert!(!text.composing(target));
+    let resized = translate(
+        &mut adapter,
+        target,
+        &WindowEvent::Resized(winit::dpi::PhysicalSize::new(100, 200)),
+        &state,
+        &mut text,
+    );
+    assert_eq!(resized.capacity(), 1);
+    assert_eq!(
+        resized[0].event,
+        SAInputEvent::Geometry {
+            size: SAPhysicalSize {
+                width: 100,
+                height: 200
+            },
+            scale: 1.5
+        }
+    );
+    assert_eq!(resized[0].origin, SAInputOrigin::NativeWindow);
+}
+
+#[test]
+fn mouse_modifier_and_relative_motion_records_keep_observed_units_and_origins() {
+    let target = target();
+    let mut adapter = NativeInputAdapter::new();
+    let mut text = TextState::new();
+    let state = SAInputState {
+        position: Some(SAPhysicalPosition { x: -5.5, y: 200.25 }),
+        ..Default::default()
+    };
+    let pressed = translate(
+        &mut adapter,
+        target,
+        &WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state: ElementState::Pressed,
+            button: MouseButton::Other(7),
+        },
+        &state,
+        &mut text,
+    );
+    assert_eq!(pressed.capacity(), 1);
+    assert_eq!(
+        pressed[0].event,
+        SAInputEvent::MouseButton {
+            button: SAMouseButton::Other(7),
+            state: SAButtonState::Pressed,
+            position: state.position,
+            scale: 1.5,
+        }
+    );
+    let modifiers = translate(
+        &mut adapter,
+        target,
+        &WindowEvent::ModifiersChanged(
+            (winit::keyboard::ModifiersState::SHIFT | winit::keyboard::ModifiersState::ALT).into(),
+        ),
+        &state,
+        &mut text,
+    );
+    assert_eq!(modifiers.capacity(), 1);
+    assert_eq!(
+        modifiers[0].event,
+        SAInputEvent::Modifiers(SAModifiers {
+            shift: true,
+            control: false,
+            alt: true,
+            super_key: false,
+        })
+    );
+    let device = crate::SAInputDeviceId {
+        host: target.id.host(),
+        native: DeviceId::dummy(),
+    };
+    let relative = adapter
+        .device_event(
+            Some(target),
+            &DeviceEvent::MouseMotion {
+                delta: (-0.25, 3.5),
+            },
+            device,
+        )
+        .unwrap();
+    assert_eq!(relative.capacity(), 1);
+    assert_eq!(
+        relative[0].event,
+        SAInputEvent::RelativeMotion { x: -0.25, y: 3.5 }
+    );
+    assert_eq!(relative[0].origin, SAInputOrigin::RawDevice);
+    assert_eq!(relative[0].device, Some(device));
+    assert!(
+        pressed
+            .iter()
+            .chain(&modifiers)
+            .all(|record| record.origin == SAInputOrigin::NativeWindow && record.device.is_none())
+    );
+}

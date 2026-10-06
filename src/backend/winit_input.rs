@@ -30,12 +30,16 @@ struct KeyMeaning {
 
 pub(crate) struct NativeInputAdapter {
     keys: HashMap<(SAWindowTarget, SAPhysicalKey), KeyMeaning>,
+    #[cfg(test)]
+    fail_next_batch_reservation: std::cell::Cell<bool>,
 }
 
 impl NativeInputAdapter {
     pub(crate) fn new() -> Self {
         Self {
             keys: HashMap::new(),
+            #[cfg(test)]
+            fail_next_batch_reservation: std::cell::Cell::new(false),
         }
     }
 
@@ -49,29 +53,65 @@ impl NativeInputAdapter {
         scale: f64,
         text: &mut TextState,
     ) -> Result<Vec<NormalizedInput>, SAError> {
-        let mut batch = Vec::new();
-        batch
-            .try_reserve(2 + state.held_keys.len() + state.held_buttons.len())
-            .map_err(|_| SAError::AllocationFailed)?;
-        match event {
-            WindowEvent::KeyboardInput {
-                event,
-                is_synthetic,
+        // Keyboard owns its complete key/text batch; do not allocate a discarded
+        // window batch before handing it over.
+        if let WindowEvent::KeyboardInput {
+            event,
+            is_synthetic,
+            ..
+        } = event
+        {
+            return self.key_event(
+                target,
+                event.physical_key,
+                &event.logical_key,
+                event.location,
+                event.state,
+                event.repeat,
+                *is_synthetic,
+                event.text_with_all_modifiers(),
+                state,
+                text,
+            );
+        }
+        let count = match event {
+            WindowEvent::Focused(false) => state
+                .held_keys
+                .len()
+                .checked_add(state.held_buttons.len())
+                .and_then(|count| count.checked_add(1))
+                .ok_or(SAError::AllocationFailed)?,
+            WindowEvent::MouseCaptureLost => state
+                .held_buttons
+                .len()
+                .checked_add(1)
+                .ok_or(SAError::AllocationFailed)?,
+            WindowEvent::MouseInput {
+                state: native_state,
+                button,
                 ..
-            } => {
-                return self.key_event(
-                    target,
-                    event.physical_key,
-                    &event.logical_key,
-                    event.location,
-                    event.state,
-                    event.repeat,
-                    *is_synthetic,
-                    event.text_with_all_modifiers(),
-                    state,
-                    text,
-                );
+            } => usize::from(
+                *native_state == ElementState::Pressed
+                    || state.held_buttons.contains(&mouse_button(*button)),
+            ),
+            WindowEvent::Ime(Ime::Enabled) => 0,
+            WindowEvent::Ime(Ime::Disabled) => {
+                usize::from(text.composing(target) && text.ime_session(target).is_some())
             }
+            WindowEvent::Ime(Ime::Preedit(..) | Ime::Commit(_)) => {
+                usize::from(text.ime_session(target).is_some())
+            }
+            WindowEvent::CursorMoved { .. }
+            | WindowEvent::MouseWheel { .. }
+            | WindowEvent::ModifiersChanged(_)
+            | WindowEvent::Focused(true)
+            | WindowEvent::Resized(_)
+            | WindowEvent::ScaleFactorChanged { .. } => 1,
+            _ => return Ok(Vec::new()),
+        };
+        // Reserve the entire output before key reconciliation or IME mutation.
+        let mut batch = self.batch(count)?;
+        match event {
             WindowEvent::CursorMoved { position, .. } => push(
                 &mut batch,
                 target,
@@ -264,14 +304,18 @@ impl NativeInputAdapter {
     ) -> Result<Vec<NormalizedInput>, SAError> {
         let physical = physical_key(physical);
         let key_state = transition(native_state);
-        let mut batch = Vec::new();
-        batch
-            .try_reserve(2)
-            .map_err(|_| SAError::AllocationFailed)?;
         if key_state == SAButtonState::Released && !state.held_keys.contains(&physical) {
             self.keys.remove(&(target, physical));
-            return Ok(batch);
+            return Ok(Vec::new());
         }
+        let committed =
+            if key_state == SAButtonState::Pressed && !synthetic && !text.composing(target) {
+                text.active(target)
+                    .zip(committed.filter(|value| !value.is_empty()))
+            } else {
+                None
+            };
+        let mut batch = self.batch(1 + usize::from(committed.is_some()))?;
         let logical = logical_key(logical);
         let location = key_location(location);
         if key_state == SAButtonState::Pressed {
@@ -306,12 +350,7 @@ impl NativeInputAdapter {
                 SAInputOrigin::NativeWindow
             },
         );
-        if key_state == SAButtonState::Pressed
-            && !synthetic
-            && !text.composing(target)
-            && let Some(session) = text.active(target)
-            && let Some(committed) = committed.filter(|value| !value.is_empty())
-        {
+        if let Some((session, committed)) = committed {
             push(
                 &mut batch,
                 target,
@@ -351,12 +390,23 @@ impl NativeInputAdapter {
             },
             _ => return Ok(Vec::new()),
         };
-        let mut batch = Vec::new();
-        batch
-            .try_reserve(1)
-            .map_err(|_| SAError::AllocationFailed)?;
+        let mut batch = self.batch(1)?;
         push(&mut batch, target, event, SAInputOrigin::RawDevice);
         batch[0].device = Some(device);
+        Ok(batch)
+    }
+
+    fn batch(&self, count: usize) -> Result<Vec<NormalizedInput>, SAError> {
+        let mut batch = Vec::new();
+        if count != 0 {
+            #[cfg(test)]
+            if self.fail_next_batch_reservation.replace(false) {
+                return Err(SAError::AllocationFailed);
+            }
+            batch
+                .try_reserve_exact(count)
+                .map_err(|_| SAError::AllocationFailed)?;
+        }
         Ok(batch)
     }
 

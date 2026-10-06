@@ -18,8 +18,8 @@ impl<A: SAApplication> SAContext<'_, A> {
         if !self.core.ordinary_open() {
             return Err(SAShellFailure::Closed);
         }
-        request.wide()?;
-        crate::backend::windows::shell::Apartment::new()?.launch(request)
+        let destination = request.prepare()?;
+        crate::backend::windows::shell::Apartment::new()?.launch(&destination)
     }
 
     /// Accepts an owned association request on the bounded dedicated helper.
@@ -40,7 +40,7 @@ impl<A: SAApplication> SAContext<'_, A> {
                     Err(SAShellFailure::Closed)
                 }
             })
-            .and_then(|()| request.wide().map(|_| ()));
+            .and_then(|()| request.validate());
         if let Err(reason) = admission {
             return Err(SAShellRejected { request, reason });
         }
@@ -123,7 +123,7 @@ mod tests {
         let (release, released) = mpsc::channel();
         core.shell = Some(
             ShellHelper::spawn(core.id, 1, move || {
-                move |_: &SAShellRequest| {
+                move |_: &super::super::PreparedRequest| {
                     entered.send(()).unwrap();
                     released.recv_timeout(Duration::from_secs(3)).unwrap();
                     Ok(())
@@ -213,7 +213,7 @@ mod tests {
                     entered,
                     release: released,
                 };
-                move |_: &SAShellRequest| {
+                move |_: &super::super::PreparedRequest| {
                     let _retained = &final_access;
                     Ok(())
                 }

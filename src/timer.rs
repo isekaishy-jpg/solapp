@@ -42,6 +42,8 @@ pub(crate) struct Timers<L> {
     records: Arena<Timer<L>>,
     heap: Vec<SlotKey>,
     pub(crate) depth: usize,
+    #[cfg(test)]
+    pub(crate) fail_next_heap_reservation: bool,
 }
 
 impl<L> Timers<L> {
@@ -51,6 +53,8 @@ impl<L> Timers<L> {
             records: Arena::new(SAIdentityKind::Timer),
             heap: Vec::new(),
             depth: 0,
+            #[cfg(test)]
+            fail_next_heap_reservation: false,
         }
     }
     pub(crate) fn schedule(
@@ -66,6 +70,10 @@ impl<L> Timers<L> {
             Ok(key) => key,
             Err(error) => return Err((payload, error)),
         };
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_heap_reservation) {
+            return Err((payload, SAError::AllocationFailed));
+        }
         if self.heap.try_reserve(1).is_err() {
             return Err((payload, SAError::AllocationFailed));
         }

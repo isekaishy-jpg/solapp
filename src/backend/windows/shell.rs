@@ -12,7 +12,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{PCWSTR, w};
 
-use crate::shell::{SAShellFailure, SAShellRequest};
+use crate::shell::{PreparedDestination, SAShellFailure};
 
 pub(crate) struct Apartment {
     _owner: PhantomData<Rc<()>>,
@@ -30,15 +30,14 @@ impl Apartment {
         })
     }
 
-    pub(crate) fn launch(&self, request: &SAShellRequest) -> Result<(), SAShellFailure> {
-        let wide = request.wide()?;
+    pub(crate) fn launch(&self, destination: &PreparedDestination) -> Result<(), SAShellFailure> {
         let mut info = SHELLEXECUTEINFOW {
             cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
             // NOASYNC covers file/DDE completion where supported. URI handlers
             // may still continue externally; success never means process exit.
             fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
             lpVerb: w!("open"),
-            lpFile: PCWSTR(wide.as_ptr()),
+            lpFile: PCWSTR(destination.wide().as_ptr()),
             nShow: SW_SHOWNORMAL.0,
             ..Default::default()
         };

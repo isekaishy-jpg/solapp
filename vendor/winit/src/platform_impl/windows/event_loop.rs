@@ -1,5 +1,6 @@
 // Modified for Solapp: report capture loss/native results, classify raw mouse motion,
-// and balance visibility by client/capture ownership, including native retirement.
+// balance visibility by client/capture ownership, including native retirement,
+// and acquire mouse capture without holding a synchronously reentered state lock.
 #![allow(non_snake_case)]
 
 mod runner;
@@ -40,7 +41,7 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Controls::{HOVER_DEFAULT, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::Input::Ime::{GCS_COMPSTR, GCS_RESULTSTR, ISC_SHOWUICOMPOSITIONWINDOW};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    GetCapture, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows_sys::Win32::UI::Input::Pointer::{
     POINTER_FLAG_DOWN, POINTER_FLAG_UP, POINTER_FLAG_UPDATE,
@@ -997,26 +998,49 @@ fn insert_event_target_window_data(
 
 /// Capture mouse input, allowing `window` to receive mouse events when the cursor is outside of
 /// the window.
-unsafe fn capture_mouse(window: HWND, window_state: &mut WindowState) {
-    window_state.mouse.capture_count += 1;
+/// Returns false if native reentry retired the destination window.
+unsafe fn capture_mouse(window: HWND, userdata: &WindowData) -> bool {
+    // SetCapture synchronously notifies the previous owner. Its application
+    // callback may request destination state, change capture again, or retire us.
     unsafe { SetCapture(window) };
-    let flags = window_state.mouse.cursor_flags();
+    // public_window_callback's recurse_depth keeps WindowData alive through
+    // native reentry, but WM_NCDESTROY invalidates its HWND before that borrow ends.
+    if userdata.userdata_removed.get() {
+        return false;
+    }
+    let flags = {
+        let mut window_state = userdata.window_state_lock();
+        // A nested capture loss resets the count; a nested button press may
+        // then reacquire this window. Commit the outer press only after reentry
+        // so it is counted alongside that press, and only if we still own capture.
+        if unsafe { GetCapture() } == window {
+            window_state.mouse.capture_count += 1;
+        }
+        window_state.mouse.cursor_flags()
+    };
+    // Refresh uses actual native capture/client ownership, never pre-call flags
+    // or unconditional destination ownership after a callback changed capture.
     util::refresh_cursor_visibility(
         window,
         flags.contains(CursorFlags::IN_WINDOW),
         flags.contains(CursorFlags::HIDDEN),
         false,
     );
+    true
 }
 
 /// Release mouse input, stopping windows on this thread from receiving mouse input when the cursor
 /// is outside the window.
-unsafe fn release_mouse(mut window_state: MutexGuard<'_, WindowState>) {
+unsafe fn release_mouse(window: HWND, mut window_state: MutexGuard<'_, WindowState>) {
     window_state.mouse.capture_count = window_state.mouse.capture_count.saturating_sub(1);
     if window_state.mouse.capture_count == 0 {
         // ReleaseCapture() causes a WM_CAPTURECHANGED where we lock the window_state.
         drop(window_state);
-        unsafe { ReleaseCapture() };
+        // A callback may have transferred capture while this button press was
+        // being acquired. Its eventual release must not release that new owner.
+        if unsafe { GetCapture() } == window {
+            unsafe { ReleaseCapture() };
+        }
     }
 }
 
@@ -1813,7 +1837,10 @@ unsafe fn public_window_callback_inner(
             use crate::event::MouseButton::Left;
             use crate::event::WindowEvent::MouseInput;
 
-            unsafe { capture_mouse(window, &mut userdata.window_state_lock()) };
+            if !unsafe { capture_mouse(window, userdata) } {
+                result = ProcResult::Value(0);
+                return;
+            }
 
             update_modifiers(window, userdata);
 
@@ -1829,7 +1856,7 @@ unsafe fn public_window_callback_inner(
             use crate::event::MouseButton::Left;
             use crate::event::WindowEvent::MouseInput;
 
-            unsafe { release_mouse(userdata.window_state_lock()) };
+            unsafe { release_mouse(window, userdata.window_state_lock()) };
 
             update_modifiers(window, userdata);
 
@@ -1845,7 +1872,10 @@ unsafe fn public_window_callback_inner(
             use crate::event::MouseButton::Right;
             use crate::event::WindowEvent::MouseInput;
 
-            unsafe { capture_mouse(window, &mut userdata.window_state_lock()) };
+            if !unsafe { capture_mouse(window, userdata) } {
+                result = ProcResult::Value(0);
+                return;
+            }
 
             update_modifiers(window, userdata);
 
@@ -1861,7 +1891,7 @@ unsafe fn public_window_callback_inner(
             use crate::event::MouseButton::Right;
             use crate::event::WindowEvent::MouseInput;
 
-            unsafe { release_mouse(userdata.window_state_lock()) };
+            unsafe { release_mouse(window, userdata.window_state_lock()) };
 
             update_modifiers(window, userdata);
 
@@ -1877,7 +1907,10 @@ unsafe fn public_window_callback_inner(
             use crate::event::MouseButton::Middle;
             use crate::event::WindowEvent::MouseInput;
 
-            unsafe { capture_mouse(window, &mut userdata.window_state_lock()) };
+            if !unsafe { capture_mouse(window, userdata) } {
+                result = ProcResult::Value(0);
+                return;
+            }
 
             update_modifiers(window, userdata);
 
@@ -1893,7 +1926,7 @@ unsafe fn public_window_callback_inner(
             use crate::event::MouseButton::Middle;
             use crate::event::WindowEvent::MouseInput;
 
-            unsafe { release_mouse(userdata.window_state_lock()) };
+            unsafe { release_mouse(window, userdata.window_state_lock()) };
 
             update_modifiers(window, userdata);
 
@@ -1910,7 +1943,10 @@ unsafe fn public_window_callback_inner(
             use crate::event::WindowEvent::MouseInput;
             let xbutton = super::get_xbutton_wparam(wparam as u32);
 
-            unsafe { capture_mouse(window, &mut userdata.window_state_lock()) };
+            if !unsafe { capture_mouse(window, userdata) } {
+                result = ProcResult::Value(0);
+                return;
+            }
 
             update_modifiers(window, userdata);
 
@@ -1935,7 +1971,7 @@ unsafe fn public_window_callback_inner(
             use crate::event::WindowEvent::MouseInput;
             let xbutton = super::get_xbutton_wparam(wparam as u32);
 
-            unsafe { release_mouse(userdata.window_state_lock()) };
+            unsafe { release_mouse(window, userdata.window_state_lock()) };
 
             update_modifiers(window, userdata);
 
