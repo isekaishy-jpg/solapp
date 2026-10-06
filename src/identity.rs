@@ -186,7 +186,39 @@ struct Slot<T> {
 
 pub(crate) struct WindowSlots<T> {
     host: SAHostId,
-    slots: Vec<Slot<T>>,
+    slots: Vec<WindowSlot<T>>,
+}
+
+struct WindowSlot<T> {
+    incarnation: Option<u64>,
+    state: WindowSlotState<T>,
+}
+
+enum WindowSlotState<T> {
+    Vacant,
+    Reserved,
+    Occupied(T),
+}
+
+impl<T> WindowSlot<T> {
+    fn value(&self) -> Option<&T> {
+        match &self.state {
+            WindowSlotState::Occupied(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn value_mut(&mut self) -> Option<&mut T> {
+        match &mut self.state {
+            WindowSlotState::Occupied(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn retire(&mut self) -> WindowSlotState<T> {
+        self.incarnation = self.incarnation.and_then(|value| value.checked_add(1));
+        std::mem::replace(&mut self.state, WindowSlotState::Vacant)
+    }
 }
 
 impl<T> WindowSlots<T> {
@@ -198,12 +230,14 @@ impl<T> WindowSlots<T> {
     }
 
     // Reserve before native construction: acquired resources always have room
-    // for their retirement record, and no callback intervenes before insertion.
+    // for their retirement record. A failed initialization stays reserved until
+    // its native destruction is acknowledged.
     pub(crate) fn reserve(&mut self) -> Result<SAWindowId, SAError> {
-        for (slot, entry) in self.slots.iter().enumerate() {
-            if entry.value.is_none()
+        for (slot, entry) in self.slots.iter_mut().enumerate() {
+            if matches!(entry.state, WindowSlotState::Vacant)
                 && let Some(incarnation) = entry.incarnation
             {
+                entry.state = WindowSlotState::Reserved;
                 return Ok(SAWindowId {
                     host: self.host,
                     slot: slot as u32,
@@ -216,9 +250,9 @@ impl<T> WindowSlots<T> {
         self.slots
             .try_reserve(1)
             .map_err(|_| SAError::AllocationFailed)?;
-        self.slots.push(Slot {
+        self.slots.push(WindowSlot {
             incarnation: Some(1),
-            value: None,
+            state: WindowSlotState::Reserved,
         });
         Ok(SAWindowId {
             host: self.host,
@@ -228,7 +262,28 @@ impl<T> WindowSlots<T> {
     }
 
     pub(crate) fn insert(&mut self, id: SAWindowId, value: T) {
-        self.slots[id.slot as usize].value = Some(value);
+        assert_eq!(id.host, self.host);
+        let entry = &mut self.slots[id.slot as usize];
+        assert_eq!(entry.incarnation, Some(id.incarnation));
+        assert!(matches!(entry.state, WindowSlotState::Reserved));
+        entry.state = WindowSlotState::Occupied(value);
+    }
+
+    // Releases only this exact reservation, never an occupied or reused slot.
+    pub(crate) fn cancel_reservation(&mut self, id: SAWindowId) -> bool {
+        if id.host != self.host {
+            return false;
+        }
+        let Some(entry) = self.slots.get_mut(id.slot as usize) else {
+            return false;
+        };
+        if entry.incarnation != Some(id.incarnation)
+            || !matches!(entry.state, WindowSlotState::Reserved)
+        {
+            return false;
+        }
+        entry.retire();
+        true
     }
 
     pub(crate) fn get(&self, id: SAWindowId) -> Result<&T, SAError> {
@@ -242,15 +297,15 @@ impl<T> WindowSlots<T> {
         if entry.incarnation != Some(id.incarnation) {
             return Err(SAError::StaleIdentity);
         }
-        entry.value.as_ref().ok_or(SAError::StaleIdentity)
+        entry.value().ok_or(SAError::StaleIdentity)
     }
 
     pub(crate) fn remove_where(&mut self, mut predicate: impl FnMut(&T) -> bool) -> Option<T> {
         for slot in &mut self.slots {
-            if slot.value.as_ref().is_some_and(&mut predicate) {
-                let value = slot.value.take();
-                slot.incarnation = slot.incarnation.and_then(|value| value.checked_add(1));
-                return value;
+            if slot.value().is_some_and(&mut predicate)
+                && let WindowSlotState::Occupied(value) = slot.retire()
+            {
+                return Some(value);
             }
         }
         None
@@ -258,14 +313,15 @@ impl<T> WindowSlots<T> {
 
     pub(crate) fn get_mut(&mut self, id: SAWindowId) -> Result<&mut T, SAError> {
         self.get(id)?;
-        Ok(self.slots[id.slot as usize].value.as_mut().unwrap())
+        Ok(self.slots[id.slot as usize].value_mut().unwrap())
     }
 
     pub(crate) fn remove(&mut self, id: SAWindowId) -> Result<T, SAError> {
         self.get(id)?;
         let entry = &mut self.slots[id.slot as usize];
-        let value = entry.value.take().unwrap();
-        entry.incarnation = entry.incarnation.and_then(|value| value.checked_add(1));
+        let WindowSlotState::Occupied(value) = entry.retire() else {
+            unreachable!("checked occupied window slot")
+        };
         Ok(value)
     }
 
@@ -277,7 +333,7 @@ impl<T> WindowSlots<T> {
                     slot: slot as u32,
                     incarnation: entry.incarnation?,
                 },
-                entry.value.as_ref()?,
+                entry.value()?,
             ))
         })
     }
@@ -293,7 +349,7 @@ impl<T> WindowSlots<T> {
                         slot: slot as u32,
                         incarnation: entry.incarnation?,
                     },
-                    entry.value.as_mut()?,
+                    entry.value_mut()?,
                 ))
             })
     }

@@ -966,14 +966,23 @@ impl<'cx, A: SAApplication> SAContext<'cx, A> {
         }
         spec.validate()?;
         let id = self.core.windows.reserve()?;
-        self.core
-            .native_windows
-            .try_reserve(1)
-            .map_err(|_| SAError::AllocationFailed)?;
-        let native = self.operations.create_window(spec)?;
+        if self.core.native_windows.try_reserve(1).is_err() {
+            self.core.windows.cancel_reservation(id);
+            return Err(SAError::AllocationFailed);
+        }
+        let native = match self.operations.create_window(spec) {
+            Ok(native) => native,
+            Err(error) => {
+                self.core.windows.cancel_reservation(id);
+                return Err(error);
+            }
+        };
         let generation = SAWindowGeneration::INITIAL;
         let target = SAWindowTarget { id, generation };
         self.core.native_windows.push((native.key(), target));
+        // A failed observation drops native ownership, but its reserved identity
+        // remains tied to this ledger entry until Destroyed acknowledges it.
+        let observed = native.display_observed()?;
         let wake = self.core.native_wake.clone();
         let wake: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
             let _ = wake.post();
@@ -987,7 +996,6 @@ impl<'cx, A: SAApplication> SAContext<'cx, A> {
                 crate::window_access::WindowAnchor::simulated(target, wake)
             }
         };
-        let observed = native.display_observed()?;
         self.core.windows.insert(
             id,
             WindowRecord {

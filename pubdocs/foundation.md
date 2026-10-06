@@ -10,6 +10,11 @@ spec and a typed `SAError`; success returns a host-scoped `SAWindowTarget`.
 This target identifies a particular native generation, not renderer readiness.
 Queries reject foreign hosts and stale identities/generations.
 
+A rejected creation can already have acquired a native window. The host retains
+that acquisition's identity and destruction obligation until native destruction
+is acknowledged, so its delayed notification cannot retire a later window.
+Rejection still returns the original specification and typed error.
+
 `request_stop` immediately closes ordinary admission and preserves the current
 callback. An OS close request on a live host window requests whole-host stop.
 For individual retirement, `request_close(target)` returns immediately and

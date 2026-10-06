@@ -722,11 +722,10 @@ impl<A: SAApplication> Core<A> {
             .position(|(current, _)| *current == key)
         {
             let target = self.native_windows[index].1;
-            if self
-                .windows
-                .get(target.id)
-                .is_ok_and(|record| record.generation == target.generation)
-            {
+            let record = self.windows.get(target.id);
+            if record.as_ref().is_ok_and(|record| {
+                record.generation == target.generation && record.native.key() == key
+            }) {
                 self.input.retire(target);
                 self.text.retire(target);
                 self.native_input.retire(target);
@@ -744,6 +743,20 @@ impl<A: SAApplication> Core<A> {
                     },
                     SAStopReason::BackendFailed,
                 );
+            } else if record.is_ok() {
+                // An inconsistent old association is not authority to invalidate
+                // a different live acquisition. Retain its roots for stop/drain.
+                self.fail(
+                    SAError::Native {
+                        operation: SANativeOperation::RunEventLoop,
+                        message: String::from(
+                            "native destruction ledger does not match live window",
+                        ),
+                    },
+                    SAStopReason::BackendFailed,
+                );
+            } else if target.generation == crate::SAWindowGeneration::INITIAL {
+                self.windows.cancel_reservation(target.id);
             }
             self.native_windows.remove(index);
             self.retired_windows += 1;
@@ -801,3 +814,7 @@ pub(crate) fn fail_stop(reason: &str) -> ! {
     );
     std::process::abort()
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/window_retirement.rs"]
+mod window_retirement_tests;

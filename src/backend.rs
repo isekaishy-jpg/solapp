@@ -31,7 +31,12 @@ impl NativeWindow {
         match self {
             Self::Winit(window) => crate::SADisplayObserved::query(window),
             #[cfg(test)]
-            Self::Test(window) => Ok(window.display.get()),
+            Self::Test(window) => {
+                if window.fail_observation.replace(false) {
+                    crate::SAScaleFactor::new(f64::NAN)?;
+                }
+                Ok(window.display.get())
+            }
         }
     }
 

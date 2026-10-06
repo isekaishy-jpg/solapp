@@ -284,3 +284,206 @@ fn repeated_native_key_reuse_keeps_old_acknowledgments_in_acquisition_order() {
     assert!(core.failure.is_none());
     assert_eq!(core.native_windows[0].1, third);
 }
+
+#[test]
+fn failed_observation_destruction_keeps_new_live_window_and_access_valid() {
+    let mut core = Core::<App>::new().unwrap();
+    let mut native = TestBackend::default();
+    let mut app = App::default();
+    core.start(&mut app, BackendOps::Test(&mut native));
+    native.fail_next_observation = true;
+    let spec = SAWindowSpec {
+        title: String::from("failed observation"),
+        visible: false,
+        size: SAPhysicalSize {
+            width: 317,
+            height: 211,
+        },
+    };
+    let title_pointer = spec.title.as_ptr();
+    let expected = spec.clone();
+    let (returned, error) = SAContext::new(
+        &mut core,
+        BackendOps::Test(&mut native),
+        SAContextPhase::Event,
+    )
+    .create_window(spec)
+    .unwrap_err()
+    .into_parts();
+    assert_eq!(returned, expected);
+    assert_eq!(returned.title.as_ptr(), title_pointer);
+    assert_eq!(error, SAScaleFactor::new(f64::NAN).unwrap_err());
+    let failed = core.native_windows[0].1;
+    assert!(core.windows.get(failed.id).is_err());
+    let current = window(&mut core, &mut native);
+    let access = SAContext::new(
+        &mut core,
+        BackendOps::Test(&mut native),
+        SAContextPhase::Event,
+    )
+    .acquire_window(current)
+    .unwrap();
+    core.native_destroyed(native.complete_destruction().unwrap());
+    assert!(access.is_native_alive());
+    assert_eq!(
+        SAContext::new(
+            &mut core,
+            BackendOps::Test(&mut native),
+            SAContextPhase::Event,
+        )
+        .window_state(current),
+        Ok(SAWindowState::Live)
+    );
+    assert!(core.failure.is_none());
+    drop(access);
+}
+
+#[test]
+fn failed_initialization_and_successful_window_acknowledge_in_either_order() {
+    use crate::backend::test::Trace;
+    for failed_first in [true, false] {
+        let mut core = Core::<App>::new().unwrap();
+        let mut native = TestBackend::default();
+        let mut app = App::default();
+        core.start(&mut app, BackendOps::Test(&mut native));
+        native.fail_next_observation = true;
+        SAContext::new(
+            &mut core,
+            BackendOps::Test(&mut native),
+            SAContextPhase::Event,
+        )
+        .create_window(SAWindowSpec {
+            title: String::from("A"),
+            ..SAWindowSpec::default()
+        })
+        .unwrap_err();
+        let (failed_key, failed) = core.native_windows[0];
+        let current = window(&mut core, &mut native);
+        assert_ne!(failed.id, current.id);
+        let current_key = core.windows.get(current.id).unwrap().native.key();
+        SAContext::new(
+            &mut core,
+            BackendOps::Test(&mut native),
+            SAContextPhase::Event,
+        )
+        .request_close(current)
+        .unwrap();
+        core.reap_closing_windows(BackendOps::Test(&mut native));
+        let order = if failed_first {
+            [failed_key, current_key]
+        } else {
+            [current_key, failed_key]
+        };
+        for (index, key) in order.into_iter().enumerate() {
+            core.native_destroyed(native.complete_destruction_of(key).unwrap());
+            assert_eq!(core.native_windows.len(), 1 - index);
+            assert_eq!(
+                core.shutdown_snapshot().pending_native_destructions,
+                1 - index
+            );
+            assert!(core.failure.is_none());
+        }
+        assert!(native.complete_destruction().is_none());
+        assert_eq!(
+            native
+                .trace
+                .borrow()
+                .iter()
+                .filter(|event| matches!(event, Trace::DestroyRequested(_)))
+                .count(),
+            2
+        );
+        let replacement = window(&mut core, &mut native);
+        assert_ne!(replacement.id, failed.id);
+        assert!(core.windows.get(failed.id).is_err());
+    }
+}
+
+#[test]
+fn stop_with_only_failed_initialization_waits_for_actual_native_acknowledgement() {
+    struct FailedStartup;
+    impl SAApplication for FailedStartup {
+        type Message = ();
+        type LocalEvent = ();
+        fn started(&mut self, cx: &mut SAContext<'_, Self>) -> Result<(), SAError> {
+            cx.create_window(SAWindowSpec::default())
+                .map(|_| ())
+                .map_err(|rejected| rejected.into_parts().1)
+        }
+        fn stopping(&mut self, _: &mut SAContext<'_, Self>) -> SAStopProgress {
+            SAStopProgress::Settled
+        }
+    }
+    let mut core = Core::<FailedStartup>::new().unwrap();
+    let mut native = TestBackend::default();
+    native.fail_next_observation = true;
+    let mut app = FailedStartup;
+    core.start(&mut app, BackendOps::Test(&mut native));
+    assert_eq!(
+        core.failure,
+        Some(SAScaleFactor::new(f64::NAN).unwrap_err())
+    );
+    assert_eq!(core.state, SAHostState::Stopping);
+    for _ in 0..3 {
+        core.poll_stop(&mut app, BackendOps::Test(&mut native));
+        let snapshot = core.shutdown_snapshot();
+        assert_eq!(snapshot.state, SAHostState::Retiring);
+        assert!(snapshot.application_settled);
+        assert_eq!(snapshot.retained_window_roots, 0);
+        assert_eq!(snapshot.external_window_leases, 0);
+        assert_eq!(snapshot.pending_native_destructions, 1);
+    }
+    core.native_destroyed(native.complete_destruction().unwrap());
+    assert_eq!(core.state, SAHostState::Closed);
+    assert_eq!(core.shutdown_snapshot().pending_native_destructions, 0);
+    assert!(native.complete_destruction().is_none());
+    let trace = native.trace.borrow();
+    assert_eq!(trace.len(), 3);
+}
+
+#[test]
+fn inconsistent_native_key_fault_retains_other_live_window_for_controlled_retirement() {
+    let mut core = Core::<App>::new().unwrap();
+    let mut native = TestBackend::default();
+    let mut app = App::default();
+    core.start(&mut app, BackendOps::Test(&mut native));
+    native.fail_next_observation = true;
+    SAContext::new(
+        &mut core,
+        BackendOps::Test(&mut native),
+        SAContextPhase::Event,
+    )
+    .create_window(SAWindowSpec::default())
+    .unwrap_err();
+    let failed = core.native_windows[0].1;
+    let current = window(&mut core, &mut native);
+    let access = SAContext::new(
+        &mut core,
+        BackendOps::Test(&mut native),
+        SAContextPhase::Event,
+    )
+    .acquire_window(current)
+    .unwrap();
+    let actual_key = core.windows.get(current.id).unwrap().native.key();
+    // Corrupt only the old acquisition association. The live record and its own
+    // native ledger entry remain the actual current acquisition.
+    core.native_windows[0].1 = current;
+    core.native_destroyed(native.complete_destruction().unwrap());
+    assert!(core.failure.is_some());
+    assert_eq!(core.stop_reason, Some(SAStopReason::BackendFailed));
+    assert!(core.windows.get(current.id).is_ok());
+    assert!(access.is_native_alive());
+    assert_eq!(core.native_windows, [(actual_key, current)]);
+    core.poll_stop(&mut app, BackendOps::Test(&mut native));
+    assert_eq!(core.state, SAHostState::Retiring);
+    assert!(native.complete_destruction().is_none());
+    drop(access);
+    core.reap_windows();
+    let key = native.complete_destruction().unwrap();
+    assert_eq!(key, actual_key);
+    core.native_destroyed(key);
+    assert_eq!(core.state, SAHostState::Closed);
+    // The intentionally lost association is private corruption, not authority
+    // to retire that reservation as if a matching acknowledgement existed.
+    assert!(core.windows.get(failed.id).is_err());
+}

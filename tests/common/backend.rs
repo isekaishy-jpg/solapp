@@ -22,6 +22,7 @@ pub(crate) struct TestBackend {
     pub(crate) fail_title: Option<String>,
     pub(crate) fail_raw: bool,
     pub(crate) fail_confine: bool,
+    pub(crate) fail_next_observation: bool,
     pending: Rc<RefCell<Vec<(u64, String)>>>,
     next_id: u64,
 }
@@ -66,6 +67,7 @@ impl TestBackend {
                 },
             }),
             fail_display: Cell::new(false),
+            fail_observation: Cell::new(std::mem::take(&mut self.fail_next_observation)),
             fail_confine: self.fail_confine,
             native_alive: Cell::new(true),
         })
@@ -77,12 +79,27 @@ impl TestBackend {
             NativeWindowKey::Test(id)
         })
     }
+
+    pub(crate) fn complete_destruction_of(
+        &mut self,
+        key: NativeWindowKey,
+    ) -> Option<NativeWindowKey> {
+        let NativeWindowKey::Test(id) = key else {
+            return None;
+        };
+        let mut pending = self.pending.borrow_mut();
+        let index = pending.iter().position(|(current, _)| *current == id)?;
+        let (_, title) = pending.remove(index);
+        self.trace.borrow_mut().push(Trace::Destroyed(title));
+        Some(key)
+    }
 }
 
 pub(crate) struct TestWindow {
     pub(crate) native_alive: Cell<bool>,
     pub(crate) display: Cell<crate::SADisplayObserved>,
     pub(crate) fail_display: Cell<bool>,
+    pub(crate) fail_observation: Cell<bool>,
     pub(crate) fail_confine: bool,
     pub(crate) id: u64,
     pub(crate) already_destroyed: bool,
