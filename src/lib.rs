@@ -119,6 +119,9 @@ mod native_integration_tests;
 #[path = "../tests/unit/pacing.rs"]
 mod pacing_tests;
 #[cfg(test)]
+#[path = "../tests/unit/post_cache_replacement.rs"]
+mod post_cache_replacement_tests;
+#[cfg(test)]
 #[path = "../tests/unit/posts.rs"]
 mod post_tests;
 #[cfg(test)]

@@ -109,113 +109,329 @@ pub(crate) struct Post<M> {
 pub(crate) enum Batch<M> {
     Empty,
     One(Post<M>),
-    Many(VecDeque<Post<M>>),
+    Many(BatchBuffer<M>),
 }
-// Only idle, empty buffers live here. Active drains own their backing, so a
-// callback can nest without holding a cache borrow or sharing a frontier.
+// A ticket travels with exclusively owned backing; neither can be cloned.
+struct BatchTicket(usize);
+pub(crate) struct BatchBuffer<M> {
+    posts: VecDeque<Post<M>>,
+    ticket: Option<BatchTicket>,
+}
+#[cfg(test)]
+impl<M> BatchBuffer<M> {
+    pub(crate) fn capacity(&self) -> usize {
+        self.posts.capacity()
+    }
+    pub(crate) fn reserve_empty_for_test(&mut self, capacity: usize) {
+        assert!(self.posts.is_empty());
+        self.posts.try_reserve_exact(capacity).unwrap();
+    }
+    pub(crate) fn into_uncached_buffer(self) -> VecDeque<Post<M>> {
+        assert!(
+            self.ticket.is_none(),
+            "complete the checkout before reusing spare backing"
+        );
+        self.posts
+    }
+}
+#[cfg(test)]
+impl<M> Batch<M> {
+    pub(crate) fn uncached_for_test(posts: VecDeque<Post<M>>) -> Self {
+        Self::Many(BatchBuffer {
+            posts,
+            ticket: None,
+        })
+    }
+}
+// Only empty, idle buffers live here. Outstanding records describe demand,
+// independently of allocated slack and of how many buffers are currently idle.
 pub(crate) struct BatchCache<M> {
     buffers: [Option<VecDeque<Post<M>>>; 2],
+    outstanding: [usize; 2],
+    large: usize,
+    small: usize,
+    #[cfg(test)]
+    rebalance_test: RebalanceTest,
+}
+#[cfg(test)]
+#[derive(Default)]
+struct RebalanceTest {
+    fail_at: Option<usize>,
+    overshoot_at: Option<usize>,
+    reservations: usize,
 }
 impl<M> BatchCache<M> {
     const BYTE_LIMIT: usize = 64 * 1024;
+    // Post contains nonzero receipt/recipient metadata, even for a ZST message.
+    const CAPACITY_LIMIT: usize = Self::BYTE_LIMIT / std::mem::size_of::<Post<M>>();
 
     pub(crate) fn new() -> Self {
         Self {
             buffers: [None, None],
+            outstanding: [0, 0],
+            large: 0,
+            small: 0,
+            #[cfg(test)]
+            rebalance_test: RebalanceTest::default(),
         }
     }
 
-    fn take(&mut self, count: usize) -> VecDeque<Post<M>> {
-        // An oversized frontier cannot return its backing to this cache. Keep
-        // the idle small buffers instead of growing and then discarding one.
-        if count
-            .checked_mul(std::mem::size_of::<Post<M>>())
-            .is_none_or(|bytes| bytes > Self::BYTE_LIMIT)
-        {
-            return VecDeque::new();
+    fn capacities_fit(a: usize, b: usize) -> bool {
+        a.checked_add(b)
+            .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<Post<M>>()))
+            .is_some_and(|bytes| bytes <= Self::BYTE_LIMIT)
+    }
+
+    fn checkout(
+        &mut self,
+        count: usize,
+        mut fail_reservation: impl FnMut() -> bool,
+    ) -> Result<BatchBuffer<M>, SAError> {
+        let ticket = self.outstanding.iter().position(|count| *count == 0);
+        if count > Self::CAPACITY_LIMIT || ticket.is_none() {
+            let mut posts = VecDeque::new();
+            if fail_reservation() {
+                return Err(SAError::AllocationFailed);
+            }
+            posts
+                .try_reserve(count)
+                .map_err(|_| SAError::AllocationFailed)?;
+            return Ok(BatchBuffer {
+                posts,
+                ticket: None,
+            });
         }
-        // Prefer the smallest sufficient buffer, then the largest one to grow.
-        let sufficient = self
+        let ticket = ticket.unwrap();
+        let other = self.outstanding.iter().copied().max().unwrap();
+        let mut large = self.large.max(count);
+        let mut small = self.small.max(count.min(other));
+        if !Self::capacities_fit(large, small) {
+            large = count.max(other);
+            small = count.min(other);
+            if !Self::capacities_fit(large, small) {
+                small = 0;
+            }
+        }
+        let selected = self
             .buffers
             .iter()
             .enumerate()
             .filter_map(|(index, buffer)| {
-                buffer.as_ref().and_then(|buffer| {
-                    (buffer.capacity() >= count).then_some((index, buffer.capacity()))
-                })
+                buffer
+                    .as_ref()
+                    .filter(|buffer| buffer.capacity() >= count)
+                    .map(|buffer| (index, buffer.capacity()))
             })
-            .min_by_key(|(_, capacity)| *capacity);
-        let selected = sufficient.or_else(|| {
-            self.buffers
-                .iter()
-                .enumerate()
-                .filter_map(|(index, buffer)| {
-                    buffer.as_ref().map(|buffer| (index, buffer.capacity()))
-                })
-                .max_by_key(|(_, capacity)| *capacity)
-        });
-        selected
+            .min_by_key(|(_, capacity)| *capacity)
+            .or_else(|| {
+                self.buffers
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, buffer)| {
+                        buffer.as_ref().map(|buffer| (index, buffer.capacity()))
+                    })
+                    .max_by_key(|(_, capacity)| *capacity)
+            });
+        let mut posts = selected
             .and_then(|(index, _)| self.buffers[index].take())
-            .unwrap_or_default()
-    }
-
-    fn growth_target(&self, current: usize, required: usize) -> usize {
-        // Preserve ordinary geometric growth when it fits alongside idle
-        // buffers. Near the combined cap, reserve only the required frontier
-        // instead of growing a reusable buffer into an immediately discarded one.
-        let idle_capacity: usize = self.buffers.iter().flatten().map(VecDeque::capacity).sum();
-        // Post always contains nonzero-sized receipt/recipient metadata.
-        let available =
-            (Self::BYTE_LIMIT / std::mem::size_of::<Post<M>>()).saturating_sub(idle_capacity);
-        let doubled = current.saturating_mul(2);
-        if doubled <= available {
-            doubled.max(required)
-        } else {
-            required
-        }
-    }
-
-    pub(crate) fn recycle(&mut self, batch: Batch<M>) {
-        match batch {
-            Batch::Empty => (),
-            Batch::Many(buffer) => {
-                assert!(buffer.is_empty(), "post batch must settle before recycling");
-                self.retain(buffer);
+            .unwrap_or_default();
+        if posts.capacity() < count {
+            let other_requirement = if count <= small { large } else { small };
+            let allowance = Self::CAPACITY_LIMIT.saturating_sub(other_requirement);
+            let idle_capacity: usize = self.buffers.iter().flatten().map(VecDeque::capacity).sum();
+            let idle_available = Self::CAPACITY_LIMIT.saturating_sub(idle_capacity);
+            // Match VecDeque's ordinary minimum geometric capacity across message
+            // layouts, including its smaller minimum for very large elements.
+            let minimum = if std::mem::size_of::<Post<M>>() <= 1024 {
+                4
+            } else {
+                1
+            };
+            let geometric = if posts.capacity() == 0 {
+                minimum
+            } else {
+                posts.capacity().saturating_mul(2)
+            };
+            let target = count.max(geometric.min(allowance).min(idle_available));
+            if fail_reservation() || posts.try_reserve_exact(target).is_err() {
+                // Failed reservation leaves VecDeque backing intact. Restore its
+                // exact original slot; observations and records are still provisional.
+                if let Some((index, _)) = selected {
+                    self.buffers[index] = Some(posts);
+                }
+                return Err(SAError::AllocationFailed);
             }
-            Batch::One(_) => unreachable!("post batch must settle before recycling"),
         }
+        self.large = large;
+        self.small = small;
+        self.outstanding[ticket] = count;
+        Ok(BatchBuffer {
+            posts,
+            ticket: Some(BatchTicket(ticket)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recycle(&mut self, batch: Batch<M>) {
+        self.complete(batch, true);
+    }
+
+    pub(crate) fn complete(&mut self, batch: Batch<M>, retain: bool) {
+        let Batch::Many(batch) = batch else {
+            assert!(
+                matches!(batch, Batch::Empty),
+                "post batch must settle before completion"
+            );
+            return;
+        };
+        assert!(
+            batch.posts.is_empty(),
+            "post batch must settle before completion"
+        );
+        let Some(BatchTicket(ticket)) = batch.ticket else {
+            return;
+        };
+        assert_ne!(
+            self.outstanding[ticket], 0,
+            "post ticket must complete exactly once"
+        );
+        self.outstanding[ticket] = 0;
+        if retain {
+            self.retain(batch.posts);
+        }
+    }
+
+    fn prepare_replacement(
+        &mut self,
+        actual: usize,
+        target: usize,
+    ) -> Result<Option<VecDeque<Post<M>>>, ()> {
+        if actual == target {
+            return Ok(None);
+        }
+        let mut replacement = VecDeque::new();
+        if target != 0 {
+            #[cfg(test)]
+            {
+                self.rebalance_test.reservations += 1;
+                if self.rebalance_test.fail_at == Some(self.rebalance_test.reservations) {
+                    return Err(());
+                }
+            }
+            #[cfg(test)]
+            let target =
+                if self.rebalance_test.overshoot_at == Some(self.rebalance_test.reservations) {
+                    Self::CAPACITY_LIMIT + 1
+                } else {
+                    target
+                };
+            replacement.try_reserve_exact(target).map_err(|_| ())?;
+        }
+        Ok(Some(replacement))
     }
 
     fn retain(&mut self, buffer: VecDeque<Post<M>>) {
         debug_assert!(buffer.is_empty());
-        if buffer.capacity() == 0 {
+        if buffer.capacity() == 0 || !Self::capacities_fit(buffer.capacity(), 0) {
             return;
         }
-        let Some(slot) = self.buffers.iter().position(Option::is_none) else {
+        let Some(empty) = self.buffers.iter().position(Option::is_none) else {
             return;
         };
-        let bytes = self
-            .buffers
-            .iter()
-            .flatten()
-            .try_fold(buffer.capacity(), |capacity, cached| {
-                capacity.checked_add(cached.capacity())
-            })
-            .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<Post<M>>()));
-        if bytes.is_some_and(|bytes| bytes <= Self::BYTE_LIMIT) {
-            self.buffers[slot] = Some(buffer);
+        let Some(existing) = self.buffers.iter().position(Option::is_some) else {
+            self.buffers[empty] = Some(buffer);
+            return;
+        };
+        let old = self.buffers[existing].as_ref().unwrap().capacity();
+        if Self::capacities_fit(buffer.capacity(), old) {
+            self.buffers[empty] = Some(buffer);
+            return;
+        }
+        let big = buffer.capacity().max(old);
+        let little = buffer.capacity().min(old);
+        let target_big = big.min(Self::CAPACITY_LIMIT.saturating_sub(self.small));
+        let target_little = little.min(Self::CAPACITY_LIMIT.saturating_sub(target_big));
+        let (new_buffer, new_old) = if buffer.capacity() >= old {
+            (target_big, target_little)
+        } else {
+            (target_little, target_big)
+        };
+        // Prepare all replacements before touching idle backing. Failure drops
+        // temporaries and returned storage, and leaves existing idle storage intact.
+        let Ok(buffer_replacement) = self.prepare_replacement(buffer.capacity(), new_buffer) else {
+            return;
+        };
+        let Ok(old_replacement) = self.prepare_replacement(old, new_old) else {
+            return;
+        };
+        let buffer_capacity = buffer_replacement
+            .as_ref()
+            .map_or(buffer.capacity(), VecDeque::capacity);
+        let old_capacity = old_replacement.as_ref().map_or(old, VecDeque::capacity);
+        if !Self::capacities_fit(buffer_capacity, old_capacity) {
+            return;
+        }
+        let buffer = buffer_replacement.unwrap_or(buffer);
+        if let Some(replacement) = old_replacement {
+            self.buffers[existing] = (replacement.capacity() != 0).then_some(replacement);
+        }
+        if buffer.capacity() != 0 {
+            self.buffers[empty] = Some(buffer);
         }
     }
 
     pub(crate) fn clear(&mut self) {
+        // An outer drain may still own a ticket when nested work closes the host.
         self.buffers = [None, None];
     }
 
+    #[cfg(test)]
+    pub(crate) fn seed_for_test(&mut self, buffer: VecDeque<Post<M>>) {
+        assert!(buffer.is_empty());
+        let total: usize = self.buffers.iter().flatten().map(VecDeque::capacity).sum();
+        if buffer.capacity() != 0
+            && Self::capacities_fit(total, buffer.capacity())
+            && let Some(slot) = self.buffers.iter().position(Option::is_none)
+        {
+            self.buffers[slot] = Some(buffer);
+        }
+    }
     #[cfg(test)]
     pub(crate) fn retained_capacities(&self) -> [usize; 2] {
         self.buffers
             .each_ref()
             .map(|buffer| buffer.as_ref().map_or(0, VecDeque::capacity))
+    }
+    #[cfg(test)]
+    pub(crate) fn state_for_test(&self) -> ([usize; 2], [usize; 2], usize, usize) {
+        (
+            self.retained_capacities(),
+            self.outstanding,
+            self.large,
+            self.small,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn set_demand_for_test(&mut self, large: usize, small: usize) {
+        assert!(small <= large && Self::capacities_fit(large, small));
+        self.large = large;
+        self.small = small;
+    }
+    #[cfg(test)]
+    pub(crate) fn configure_rebalance_for_test(
+        &mut self,
+        fail_at: Option<usize>,
+        overshoot_at: Option<usize>,
+    ) {
+        self.rebalance_test = RebalanceTest {
+            fail_at,
+            overshoot_at,
+            reservations: 0,
+        };
+    }
+    #[cfg(test)]
+    pub(crate) fn rebalance_reservations_for_test(&self) -> usize {
+        self.rebalance_test.reservations
     }
 }
 impl<M> Iterator for Batch<M> {
@@ -227,7 +443,7 @@ impl<M> Iterator for Batch<M> {
                 Self::One(post) => Some(post),
                 _ => unreachable!(),
             },
-            Self::Many(posts) => posts.pop_front(),
+            Self::Many(batch) => batch.posts.pop_front(),
         }
     }
 }
@@ -368,31 +584,21 @@ impl<M: Send + 'static> Transport<M> {
                 None => Batch::Empty,
             });
         }
-        let mut batch = cache.take(count);
-        if batch.capacity() < count {
+        let mut batch = cache.checkout(count, || {
             #[cfg(test)]
-            if self
-                .fail_next_batch_reservation
-                .swap(false, Ordering::Relaxed)
             {
-                cache.retain(batch);
-                return Err(SAError::AllocationFailed);
+                self.fail_next_batch_reservation
+                    .swap(false, Ordering::Relaxed)
             }
-            let reservation = if batch.capacity() == 0 {
-                batch.try_reserve(count)
-            } else {
-                let target = cache.growth_target(batch.capacity(), count);
-                batch.try_reserve_exact(target)
-            };
-            if reservation.is_err() {
-                cache.retain(batch);
-                return Err(SAError::AllocationFailed);
+            #[cfg(not(test))]
+            {
+                false
             }
-        }
+        })?;
         let mut state = lock(&self.state);
         for _ in 0..count {
             if let Some(post) = state.queue.pop_front() {
-                batch.push_back(post);
+                batch.posts.push_back(post);
             }
         }
         Ok(Batch::Many(batch))
@@ -435,7 +641,7 @@ impl<M: Send + 'static> Transport<M> {
                 batch.push_back(post);
             }
         }
-        Ok(Batch::Many(batch))
+        Ok(Batch::uncached_for_test(batch))
     }
 
     // The timing fixture keeps the same accepted posts alive across iterations.
@@ -443,6 +649,12 @@ impl<M: Send + 'static> Transport<M> {
     // settling receipts, invoking destructors or changing accepted capacity.
     #[cfg(test)]
     pub(crate) fn restore_for_measurement(&self, mut batch: Batch<M>) -> Batch<M> {
+        if let Batch::Many(buffer) = &batch {
+            assert!(
+                buffer.ticket.is_none(),
+                "complete the real checkout before restoring measurement posts"
+            );
+        }
         let mut state = lock(&self.state);
         for post in batch.by_ref() {
             state.queue.push_back(post);

@@ -68,6 +68,12 @@ allocation. These limits cover idle backing, excluding active batches, receipts,
 payload-owned storage and allocator overhead. Buffers return only after complete
 settlement and disposal, and cached storage is released when the host closes.
 An oversized drain preserves any smaller idle buffers for later reuse.
+The cache uses observed overlapping batch sizes to budget growth and can replace
+empty backing after settlement to make room for a reusable pair. This adjustment
+is best effort: failure to allocate replacement backing cannot change completed
+receipts or the drain result. Temporary replacement backing is additional to the
+idle retention limit. More than two participating batches use uncached backing;
+all outstanding batches keep their independent ownership through completion.
 
 The native wake is a hint backed by finite intake rechecks. Close and enqueue
 share one admission lock. A failed wake cannot change an accepted post into a

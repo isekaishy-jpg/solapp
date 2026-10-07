@@ -756,9 +756,9 @@ impl<'cx, A: SAApplication> SAContext<'cx, A> {
             }
         }
         // A nested service can finish closure before this drain returns.
-        if self.core.state != crate::SAHostState::Closed {
-            self.core.post_batches.recycle(batch);
-        }
+        self.core
+            .post_batches
+            .complete(batch, self.core.state != crate::SAHostState::Closed);
         if let Some(error) = failure {
             Err(error)
         } else {

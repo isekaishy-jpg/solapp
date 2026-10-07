@@ -658,7 +658,7 @@ fn warmed_detached_buffers_remove_backing_allocations_without_pooling_receipts()
 
 #[test]
 fn alternating_near_limit_batches_reuse_backing_without_displacing_idle_buffers() {
-    use crate::post::{Batch, Post};
+    use crate::post::Post;
     use std::collections::VecDeque;
     for (lower, higher, spare) in [(500, 600, 0), (500, 600, 100), (300, 400, 200)] {
         let mut core = Core::<App>::with_config(&SAHostConfig {
@@ -713,7 +713,7 @@ fn alternating_near_limit_batches_reuse_backing_without_displacing_idle_buffers(
                 disposed += count;
                 if round == 0 && count == lower && spare != 0 {
                     core.post_batches
-                        .recycle(Batch::Many(VecDeque::with_capacity(spare)));
+                        .seed_for_test(VecDeque::with_capacity(spare));
                 }
                 let retained = core.post_batches.retained_capacities();
                 assert!(retained.iter().any(|capacity| *capacity >= count));
@@ -745,31 +745,178 @@ fn alternating_near_limit_batches_reuse_backing_without_displacing_idle_buffers(
 }
 
 #[test]
+fn asymmetric_nested_batches_reuse_fitting_backing_after_warmup() {
+    use crate::post::Post;
+    use std::collections::VecDeque;
+    let limit = 64 * 1024 / std::mem::size_of::<Post<Message>>();
+    let small = limit * 35 / 100;
+    let large = limit * 59 / 100;
+    for (seeds, outer_count, inner_count) in [
+        ([large, 0], small, large),
+        ([limit * 44 / 100, limit * 50 / 100], large, small),
+        // A large idle buffer must not cause small nested drains to allocate
+        // forever after the first small buffer has been taken by the outer drain.
+        ([large, 0], limit * 2 / 100, limit * 2 / 100),
+        ([large, limit * 2 / 100], limit * 2 / 100, small),
+        ([large, small], small, limit * 2 / 100),
+    ] {
+        let mut core = Core::<App>::with_config(&SAHostConfig {
+            post_capacity: outer_count + inner_count,
+            ..SAHostConfig::default()
+        })
+        .unwrap();
+        let mut app = App::new();
+        let recipient = setup(&mut core, &mut app);
+        for seed in seeds.into_iter().filter(|seed| *seed != 0) {
+            core.post_batches
+                .seed_for_test(VecDeque::with_capacity(seed));
+        }
+        let mut disposed = 0;
+        for round in 0..6 {
+            let mut batches = Vec::new();
+            let mut receipts = Vec::new();
+            for count in [outer_count, inner_count] {
+                receipts.extend((0..count).map(|value| {
+                    core.proxy()
+                        .try_post(recipient, Message::new(value as u8, &app.drops))
+                        .unwrap()
+                }));
+                let (batch, allocations) = crate::allocation_probe::measure(|| {
+                    core.transport
+                        .detach(count, &mut core.post_batches)
+                        .unwrap()
+                });
+                if round >= 2 {
+                    assert_eq!(
+                        allocations.allocations + allocations.reallocations,
+                        0,
+                        "seeds={seeds:?} outer={outer_count} inner={inner_count} round={round}"
+                    );
+                    assert_eq!(
+                        allocations.requested_bytes + allocations.reallocated_bytes,
+                        0
+                    );
+                }
+                batches.push(batch);
+            }
+            assert_eq!(core.transport.accepted(), outer_count + inner_count);
+            assert_eq!(core.transport.len(), 0);
+            assert!(
+                receipts
+                    .iter()
+                    .all(|r| r.outcome() == SAPostOutcome::Pending)
+            );
+            assert_eq!(app.drops.lock().unwrap().len(), disposed);
+            // The child settles while the outer batch still owns all its posts.
+            settle_batch(&mut core, batches.pop().unwrap());
+            assert_eq!(core.transport.accepted(), outer_count);
+            settle_batch(&mut core, batches.pop().unwrap());
+            disposed += outer_count + inner_count;
+            assert_eq!(core.transport.accepted(), 0);
+            assert_eq!(app.drops.lock().unwrap().len(), disposed);
+            assert!(
+                receipts
+                    .iter()
+                    .all(|r| r.outcome() == SAPostOutcome::Delivered { callbacks: 0 })
+            );
+            assert!(
+                core.post_batches
+                    .retained_capacities()
+                    .iter()
+                    .sum::<usize>()
+                    <= limit
+            );
+        }
+        assert!(
+            app.drops
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, owner)| *owner == thread::current().id())
+        );
+    }
+}
+
+#[test]
+fn smaller_nonnested_batches_reuse_sufficient_large_backing_immediately() {
+    use crate::post::Post;
+    use std::collections::VecDeque;
+    let limit = 64 * 1024 / std::mem::size_of::<Post<Message>>();
+    let small = limit * 35 / 100;
+    let large = limit * 59 / 100;
+    let mut core = Core::<App>::with_config(&SAHostConfig {
+        post_capacity: small,
+        ..SAHostConfig::default()
+    })
+    .unwrap();
+    let mut app = App::new();
+    let recipient = setup(&mut core, &mut app);
+    core.post_batches
+        .seed_for_test(VecDeque::with_capacity(large));
+    for _ in 0..6 {
+        let receipts: Vec<_> = (0..small)
+            .map(|value| {
+                core.proxy()
+                    .try_post(recipient, Message::new(value as u8, &app.drops))
+                    .unwrap()
+            })
+            .collect();
+        // A lone sufficient buffer is ordinary best fit, so even a pending
+        // reservation failure must remain unconsumed by this checkout.
+        core.transport
+            .fail_next_batch_reservation
+            .store(true, Ordering::Relaxed);
+        let (batch, allocations) = crate::allocation_probe::measure(|| {
+            core.transport
+                .detach(small, &mut core.post_batches)
+                .unwrap()
+        });
+        assert_eq!(allocations.allocations, 0);
+        assert!(
+            core.transport
+                .fail_next_batch_reservation
+                .load(Ordering::Relaxed)
+        );
+        assert_eq!(allocations.reallocations, 0);
+        settle_batch(&mut core, batch);
+        let retained = core.post_batches.retained_capacities();
+        assert!(retained.contains(&large));
+        assert!(retained.iter().sum::<usize>() <= limit);
+        assert_eq!(core.transport.accepted(), 0);
+        assert!(
+            receipts
+                .iter()
+                .all(|r| r.outcome() == SAPostOutcome::Delivered { callbacks: 0 })
+        );
+    }
+}
+
+#[test]
 fn cache_retains_only_two_empty_buffers_with_combined_actual_capacity_byte_cap() {
-    use crate::post::{Batch, BatchCache, Post};
+    use crate::post::{BatchCache, Post};
     use std::collections::VecDeque;
     let mut cache = BatchCache::<Message>::new();
     for _ in 0..3 {
-        cache.recycle(Batch::Many(VecDeque::with_capacity(2)));
+        cache.seed_for_test(VecDeque::with_capacity(2));
     }
     assert_eq!(cache.retained_capacities(), [2, 2]);
     cache.clear();
     let capacity = (64 * 1024 / std::mem::size_of::<Post<Message>>()) * 3 / 4;
-    cache.recycle(Batch::Many(VecDeque::with_capacity(capacity)));
-    cache.recycle(Batch::Many(VecDeque::with_capacity(capacity)));
+    cache.seed_for_test(VecDeque::with_capacity(capacity));
+    cache.seed_for_test(VecDeque::with_capacity(capacity));
     assert_eq!(cache.retained_capacities(), [capacity, 0]);
     let actual_bytes =
         cache.retained_capacities().iter().sum::<usize>() * std::mem::size_of::<Post<Message>>();
     assert!(actual_bytes <= 64 * 1024);
     cache.clear();
-    cache.recycle(Batch::Many(VecDeque::with_capacity(
+    cache.seed_for_test(VecDeque::with_capacity(
         64 * 1024 / std::mem::size_of::<Post<Message>>() + 1,
-    )));
+    ));
     assert_eq!(cache.retained_capacities(), [0, 0]);
     // A two-post batch with a large inline message is still supported, but its
     // idle backing cannot fit the retention policy.
     let mut large = BatchCache::<[u8; 64 * 1024]>::new();
-    large.recycle(Batch::Many(VecDeque::with_capacity(2)));
+    large.seed_for_test(VecDeque::with_capacity(2));
     assert_eq!(large.retained_capacities(), [0, 0]);
 }
 
@@ -826,9 +973,8 @@ fn active_batches_exclusively_take_cached_buffers_and_deeper_nesting_allocates()
     let recipient = setup(&mut core, &mut app);
     // Fill both cache slots with empty backing without ever sharing a batch.
     for _ in 0..2 {
-        core.post_batches.recycle(crate::post::Batch::Many(
-            std::collections::VecDeque::with_capacity(2),
-        ));
+        core.post_batches
+            .seed_for_test(std::collections::VecDeque::with_capacity(2));
     }
     let mut batches = Vec::new();
     for depth in 0..4 {
@@ -895,9 +1041,9 @@ fn nested_callbacks_beyond_cache_depth_preserve_outer_frontiers_and_disposal() {
     )
     .unwrap();
     for _ in 0..2 {
-        cx.core.post_batches.recycle(crate::post::Batch::Many(
-            std::collections::VecDeque::with_capacity(2),
-        ));
+        cx.core
+            .post_batches
+            .seed_for_test(std::collections::VecDeque::with_capacity(2));
     }
     for value in [1, 2] {
         app.created.push(
@@ -1118,9 +1264,9 @@ fn nested_stop_and_fault_exhaust_both_owned_tails_before_recycling() {
         )
         .unwrap();
         for _ in 0..2 {
-            cx.core.post_batches.recycle(crate::post::Batch::Many(
-                std::collections::VecDeque::with_capacity(2),
-            ));
+            cx.core
+                .post_batches
+                .seed_for_test(std::collections::VecDeque::with_capacity(2));
         }
         let outer = [1, 2].map(|value| {
             cx.proxy()
@@ -1174,9 +1320,9 @@ fn final_native_destruction_ack_clears_retained_post_backing_while_host_survives
     );
     cx.create_window(SAWindowSpec::default()).unwrap();
     for _ in 0..2 {
-        cx.core.post_batches.recycle(crate::post::Batch::Many(
-            std::collections::VecDeque::with_capacity(2),
-        ));
+        cx.core
+            .post_batches
+            .seed_for_test(std::collections::VecDeque::with_capacity(2));
     }
     cx.request_stop();
     core.poll_stop(&mut app, BackendOps::Test(&mut native));
@@ -1192,9 +1338,8 @@ fn cached_backing_needs_no_reservation_and_empty_singleton_leave_cache_idle() {
     let mut core = Core::<App>::new().unwrap();
     let mut app = App::new();
     let recipient = setup(&mut core, &mut app);
-    core.post_batches.recycle(crate::post::Batch::Many(
-        std::collections::VecDeque::with_capacity(2),
-    ));
+    core.post_batches
+        .seed_for_test(std::collections::VecDeque::with_capacity(2));
     let capacities = core.post_batches.retained_capacities();
     core.transport
         .fail_next_batch_reservation
@@ -1312,16 +1457,16 @@ fn detached_post_buffer_timing_matrix() {
                                 drop(batch);
                             }
                             if variant == 1 && index + 1 == counts.len() {
-                                core.post_batches.clear();
+                                assert_eq!(core.post_batches.state_for_test().1, [0, 0]);
+                                core.post_batches = crate::post::BatchCache::new();
                             }
                             if iteration >= WARMUP {
                                 total_elapsed += start.elapsed();
                             }
-                            spare = match core
-                                .transport
-                                .restore_for_measurement(crate::post::Batch::Many(spare))
-                            {
-                                crate::post::Batch::Many(empty) => empty,
+                            spare = match core.transport.restore_for_measurement(
+                                crate::post::Batch::uncached_for_test(spare),
+                            ) {
+                                crate::post::Batch::Many(empty) => empty.into_uncached_buffer(),
                                 _ => unreachable!(),
                             };
                         }
@@ -1337,16 +1482,17 @@ fn detached_post_buffer_timing_matrix() {
                             drop(batch);
                         }
                         if variant == 1 && index + 1 == counts.len() {
-                            core.post_batches.clear();
+                            assert_eq!(core.post_batches.state_for_test().1, [0, 0]);
+                            core.post_batches = crate::post::BatchCache::new();
                         }
                         if iteration >= WARMUP {
                             total_elapsed += start.elapsed();
                         }
                         spare = match core
                             .transport
-                            .restore_for_measurement(crate::post::Batch::Many(spare))
+                            .restore_for_measurement(crate::post::Batch::uncached_for_test(spare))
                         {
-                            crate::post::Batch::Many(empty) => empty,
+                            crate::post::Batch::Many(empty) => empty.into_uncached_buffer(),
                             _ => unreachable!(),
                         };
                     }
