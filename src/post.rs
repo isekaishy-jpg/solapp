@@ -111,6 +111,113 @@ pub(crate) enum Batch<M> {
     One(Post<M>),
     Many(VecDeque<Post<M>>),
 }
+// Only idle, empty buffers live here. Active drains own their backing, so a
+// callback can nest without holding a cache borrow or sharing a frontier.
+pub(crate) struct BatchCache<M> {
+    buffers: [Option<VecDeque<Post<M>>>; 2],
+}
+impl<M> BatchCache<M> {
+    const BYTE_LIMIT: usize = 64 * 1024;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            buffers: [None, None],
+        }
+    }
+
+    fn take(&mut self, count: usize) -> VecDeque<Post<M>> {
+        // An oversized frontier cannot return its backing to this cache. Keep
+        // the idle small buffers instead of growing and then discarding one.
+        if count
+            .checked_mul(std::mem::size_of::<Post<M>>())
+            .is_none_or(|bytes| bytes > Self::BYTE_LIMIT)
+        {
+            return VecDeque::new();
+        }
+        // Prefer the smallest sufficient buffer, then the largest one to grow.
+        let sufficient = self
+            .buffers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, buffer)| {
+                buffer.as_ref().and_then(|buffer| {
+                    (buffer.capacity() >= count).then_some((index, buffer.capacity()))
+                })
+            })
+            .min_by_key(|(_, capacity)| *capacity);
+        let selected = sufficient.or_else(|| {
+            self.buffers
+                .iter()
+                .enumerate()
+                .filter_map(|(index, buffer)| {
+                    buffer.as_ref().map(|buffer| (index, buffer.capacity()))
+                })
+                .max_by_key(|(_, capacity)| *capacity)
+        });
+        selected
+            .and_then(|(index, _)| self.buffers[index].take())
+            .unwrap_or_default()
+    }
+
+    fn growth_target(&self, current: usize, required: usize) -> usize {
+        // Preserve ordinary geometric growth when it fits alongside idle
+        // buffers. Near the combined cap, reserve only the required frontier
+        // instead of growing a reusable buffer into an immediately discarded one.
+        let idle_capacity: usize = self.buffers.iter().flatten().map(VecDeque::capacity).sum();
+        // Post always contains nonzero-sized receipt/recipient metadata.
+        let available =
+            (Self::BYTE_LIMIT / std::mem::size_of::<Post<M>>()).saturating_sub(idle_capacity);
+        let doubled = current.saturating_mul(2);
+        if doubled <= available {
+            doubled.max(required)
+        } else {
+            required
+        }
+    }
+
+    pub(crate) fn recycle(&mut self, batch: Batch<M>) {
+        match batch {
+            Batch::Empty => (),
+            Batch::Many(buffer) => {
+                assert!(buffer.is_empty(), "post batch must settle before recycling");
+                self.retain(buffer);
+            }
+            Batch::One(_) => unreachable!("post batch must settle before recycling"),
+        }
+    }
+
+    fn retain(&mut self, buffer: VecDeque<Post<M>>) {
+        debug_assert!(buffer.is_empty());
+        if buffer.capacity() == 0 {
+            return;
+        }
+        let Some(slot) = self.buffers.iter().position(Option::is_none) else {
+            return;
+        };
+        let bytes = self
+            .buffers
+            .iter()
+            .flatten()
+            .try_fold(buffer.capacity(), |capacity, cached| {
+                capacity.checked_add(cached.capacity())
+            })
+            .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<Post<M>>()));
+        if bytes.is_some_and(|bytes| bytes <= Self::BYTE_LIMIT) {
+            self.buffers[slot] = Some(buffer);
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.buffers = [None, None];
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_capacities(&self) -> [usize; 2] {
+        self.buffers
+            .each_ref()
+            .map(|buffer| buffer.as_ref().map_or(0, VecDeque::capacity))
+    }
+}
 impl<M> Iterator for Batch<M> {
     type Item = Post<M>;
     fn next(&mut self) -> Option<Self::Item> {
@@ -246,7 +353,11 @@ impl<M: Send + 'static> Transport<M> {
     pub(crate) fn pop(&self) -> Option<Post<M>> {
         lock(&self.state).queue.pop_front()
     }
-    pub(crate) fn detach(&self, budget: usize) -> Result<Batch<M>, SAError> {
+    pub(crate) fn detach(
+        &self,
+        budget: usize,
+        cache: &mut BatchCache<M>,
+    ) -> Result<Batch<M>, SAError> {
         let count = self.len().min(budget);
         if count == 0 {
             return Ok(Batch::Empty);
@@ -257,7 +368,57 @@ impl<M: Send + 'static> Transport<M> {
                 None => Batch::Empty,
             });
         }
-        #[cfg(test)]
+        let mut batch = cache.take(count);
+        if batch.capacity() < count {
+            #[cfg(test)]
+            if self
+                .fail_next_batch_reservation
+                .swap(false, Ordering::Relaxed)
+            {
+                cache.retain(batch);
+                return Err(SAError::AllocationFailed);
+            }
+            let reservation = if batch.capacity() == 0 {
+                batch.try_reserve(count)
+            } else {
+                let target = cache.growth_target(batch.capacity(), count);
+                batch.try_reserve_exact(target)
+            };
+            if reservation.is_err() {
+                cache.retain(batch);
+                return Err(SAError::AllocationFailed);
+            }
+        }
+        let mut state = lock(&self.state);
+        for _ in 0..count {
+            if let Some(post) = state.queue.pop_front() {
+                batch.push_back(post);
+            }
+        }
+        Ok(Batch::Many(batch))
+    }
+    pub(crate) fn settled(&self) {
+        let mut state = lock(&self.state);
+        state.accepted -= 1;
+    }
+
+    // Exact baseline detachment path for the ignored performance fixture. It
+    // has no cache lookup/recycling; admission and receipts are still current.
+    #[cfg(test)]
+    pub(crate) fn detach_uncached_for_measurement(
+        &self,
+        budget: usize,
+    ) -> Result<Batch<M>, SAError> {
+        let count = self.len().min(budget);
+        if count == 0 {
+            return Ok(Batch::Empty);
+        }
+        if count == 1 {
+            return Ok(match lock(&self.state).queue.pop_front() {
+                Some(post) => Batch::One(post),
+                None => Batch::Empty,
+            });
+        }
         if self
             .fail_next_batch_reservation
             .swap(false, Ordering::Relaxed)
@@ -276,8 +437,16 @@ impl<M: Send + 'static> Transport<M> {
         }
         Ok(Batch::Many(batch))
     }
-    pub(crate) fn settled(&self) {
+
+    // The timing fixture keeps the same accepted posts alive across iterations.
+    // Restore ownership outside the timed region, without admitting new posts,
+    // settling receipts, invoking destructors or changing accepted capacity.
+    #[cfg(test)]
+    pub(crate) fn restore_for_measurement(&self, mut batch: Batch<M>) -> Batch<M> {
         let mut state = lock(&self.state);
-        state.accepted -= 1;
+        for post in batch.by_ref() {
+            state.queue.push_back(post);
+        }
+        batch
     }
 }

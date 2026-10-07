@@ -38,6 +38,7 @@ fn handler(
         return SAPropagation::Continue;
     };
     app.trace.push((**event, sample.elapsed()));
+    assert_eq!(cx.core.timers.counts(), cx.core.timers.scanned_counts());
     assert!(matches!(cx.cancel_timer(*id), Ok(SATimerCancel::Claimed)));
     match app.action {
         Action::AddDue if **event == 1 => {
@@ -63,6 +64,7 @@ fn handler(
         }
         _ => (),
     }
+    assert_eq!(cx.core.timers.counts(), cx.core.timers.scanned_counts());
     SAPropagation::Continue
 }
 fn limit_handler(
@@ -118,6 +120,7 @@ fn claims_cancellation_callback_additions_and_nested_samples_follow_selected_sto
             trace: Vec::new(),
         };
         let report = cx.service_timers(&mut app, 8).unwrap();
+        assert_eq!(cx.core.timers.counts(), cx.core.timers.scanned_counts());
         assert_eq!(report.sample.elapsed(), Duration::from_millis(100));
         assert!(matches!(cx.cancel_timer(first), Ok(SATimerCancel::Stale)));
         match app.action {
@@ -143,6 +146,137 @@ fn claims_cancellation_callback_additions_and_nested_samples_follow_selected_sto
             ),
             _ => unreachable!(),
         }
+    }
+}
+
+#[test]
+fn timer_counts_match_records_through_claim_cancel_rollback_stale_and_repeated_release() {
+    let mut core = Core::<App>::new().unwrap();
+    core.clock.manual = Some(Duration::ZERO);
+    let mut cx = SAContext::new(&mut core, BackendOps::Unavailable, SAContextPhase::Event);
+    let recipient = cx.create_recipient().unwrap();
+    let sample = cx.clock().raw;
+    let deadline = sample.checked_add(Duration::ZERO).unwrap();
+    let check = |timers: &crate::timer::Timers<u8>, expected| {
+        assert_eq!(timers.counts(), expected);
+        assert_eq!(timers.counts(), timers.scanned_counts());
+    };
+    let pending = cx.core.timers.schedule(recipient, deadline, 1).unwrap();
+    check(&cx.core.timers, (1, 0));
+    cx.core.timers.fail_next_heap_reservation = true;
+    assert!(cx.core.timers.schedule(recipient, deadline, 2).is_err());
+    check(&cx.core.timers, (1, 0));
+    let first = cx.core.timers.claim(sample).unwrap();
+    assert_eq!(first.id, pending);
+    check(&cx.core.timers, (0, 1));
+    assert!(matches!(
+        cx.core.timers.cancel(first.id),
+        Ok(SATimerCancel::Claimed)
+    ));
+    let second_id = cx.core.timers.schedule(recipient, deadline, 2).unwrap();
+    let second = cx.core.timers.claim(sample).unwrap();
+    assert_eq!(second.id, second_id);
+    check(&cx.core.timers, (0, 2));
+    assert_eq!(first.payload, 1);
+    cx.core.timers.release(first.id);
+    cx.core.timers.release(first.id);
+    check(&cx.core.timers, (0, 1));
+    let replacement = cx.core.timers.schedule(recipient, deadline, 3).unwrap();
+    cx.core.timers.release(first.id);
+    cx.core.timers.release(replacement);
+    cx.core.timers.release(SATimerId {
+        host: SAHostId::allocate().unwrap(),
+        key: second.id.key,
+    });
+    check(&cx.core.timers, (1, 1));
+    assert!(matches!(
+        cx.core.timers.cancel(replacement),
+        Ok(SATimerCancel::Removed(3))
+    ));
+    check(&cx.core.timers, (0, 1));
+    assert_eq!(second.payload, 2);
+    cx.core.timers.release(second.id);
+    cx.core.timers.release(second.id);
+    check(&cx.core.timers, (0, 0));
+}
+
+#[test]
+fn claimed_counts_settle_after_callback_or_payload_panic_and_shutdown_disposal() {
+    use std::{cell::Cell, rc::Rc};
+    struct Payload {
+        drops: Rc<Cell<usize>>,
+        panic: bool,
+    }
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            assert!(!self.panic, "timer payload destructor fixture");
+        }
+    }
+    struct PanicApp {
+        callback_panics: bool,
+    }
+    impl SAApplication for PanicApp {
+        type Message = ();
+        type LocalEvent = Payload;
+        fn started(&mut self, _: &mut SAContext<'_, Self>) -> Result<(), SAError> {
+            Ok(())
+        }
+        fn stopping(&mut self, _: &mut SAContext<'_, Self>) -> SAStopProgress {
+            SAStopProgress::Settled
+        }
+    }
+    fn callback(
+        app: &mut PanicApp,
+        cx: &mut SAContext<'_, PanicApp>,
+        _: &SAEvent<'_, (), Payload>,
+    ) -> SAPropagation {
+        assert_eq!(cx.core.timers.counts(), (1, 1));
+        assert_eq!(cx.core.timers.counts(), cx.core.timers.scanned_counts());
+        assert!(!app.callback_panics, "timer callback fixture");
+        SAPropagation::Continue
+    }
+    for callback_panics in [false, true] {
+        let drops = Rc::new(Cell::new(0));
+        let mut app = PanicApp { callback_panics };
+        let mut core = Core::<PanicApp>::new().unwrap();
+        core.clock.manual = Some(Duration::ZERO);
+        {
+            let mut cx = SAContext::new(&mut core, BackendOps::Unavailable, SAContextPhase::Event);
+            let recipient = cx.create_recipient().unwrap();
+            cx.subscribe(
+                recipient,
+                SAEventFilter::Timer,
+                SAPriority::default(),
+                callback,
+            )
+            .unwrap();
+            for (delay, panic) in [(0, !callback_panics), (1000, false)] {
+                let deadline = cx
+                    .clock()
+                    .raw
+                    .checked_add(Duration::from_millis(delay))
+                    .unwrap();
+                cx.schedule_timer(
+                    recipient,
+                    deadline,
+                    Payload {
+                        drops: Rc::clone(&drops),
+                        panic,
+                    },
+                )
+                .unwrap();
+            }
+            let result = cx.service_timers(&mut app, 2);
+            assert_eq!(result.is_err(), callback_panics);
+            assert_eq!(cx.core.timers.counts(), (1, 0));
+            assert_eq!(cx.core.timers.counts(), cx.core.timers.scanned_counts());
+            assert_eq!(drops.get(), 1);
+        }
+        core.poll_stop(&mut app, BackendOps::Unavailable);
+        assert_eq!(core.timers.counts(), (0, 0));
+        assert_eq!(core.timers.counts(), core.timers.scanned_counts());
+        assert_eq!(drops.get(), 2);
     }
 }
 
@@ -344,4 +478,47 @@ fn failed_heap_admission_preserves_original_payload_and_reusable_candidate_witho
     assert_eq!(report.claimed, 1);
     assert_eq!(app.trace, [(2, Duration::ZERO)]);
     assert_eq!(cx.core.timers.counts(), (0, 0));
+}
+
+#[test]
+#[ignore = "release-build measurement; no timing thresholds"]
+fn timer_counts_historical_peak_measurement() {
+    use std::{hint::black_box, time::Instant};
+    for peak in [16, 1024, 16384, 65536] {
+        let mut core = Core::<App>::new().unwrap();
+        core.clock.manual = Some(Duration::ZERO);
+        let mut cx = SAContext::new(&mut core, BackendOps::Unavailable, SAContextPhase::Event);
+        let recipient = cx.create_recipient().unwrap();
+        let sample = cx.clock().raw;
+        let due = sample.checked_add(Duration::ZERO).unwrap();
+        for value in 0..peak {
+            cx.core
+                .timers
+                .schedule(recipient, due, (value % 256) as u8)
+                .unwrap();
+        }
+        while cx.core.timers.cancel_next().is_some() {}
+        for value in 0..8 {
+            cx.core.timers.schedule(recipient, due, value).unwrap();
+        }
+        let claimed = cx.core.timers.claim(sample).unwrap();
+        assert_eq!(cx.core.timers.counts(), (7, 1));
+        assert_eq!(cx.core.timers.scanned_counts(), (7, 1));
+        let queries = 10000;
+        for _ in 0..100 {
+            black_box(cx.core.timers.counts());
+        }
+        for trial in 0..7 {
+            let start = Instant::now();
+            for _ in 0..queries {
+                black_box(black_box(&cx.core.timers).counts());
+            }
+            println!(
+                "timer-counts peak={peak} live=8 pending=7 claimed=1 trial={trial} queries={queries} elapsed_ns={}",
+                start.elapsed().as_nanos()
+            );
+        }
+        cx.core.timers.release(claimed.id);
+        assert_eq!(cx.core.timers.counts(), (7, 0));
+    }
 }

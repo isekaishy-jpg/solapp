@@ -44,6 +44,8 @@ pub struct SAShellRequest {
 
 impl SAShellRequest {
     fn validate(&self) -> Result<(), SAShellFailure> {
+        #[cfg(test)]
+        VALIDATIONS.with(|count| count.set(count.get() + 1));
         match &self.destination {
             SAShellDestination::Url(url) => {
                 if url.is_empty() || url.contains('\0') {
@@ -79,13 +81,23 @@ impl SAShellRequest {
 
     fn prepare(&self) -> Result<PreparedDestination, SAShellFailure> {
         self.validate()?;
+        ValidatedDestination { request: self }.prepare()
+    }
+}
+
+// The borrow prevents mutation between validation and synchronous preparation.
+struct ValidatedDestination<'a> {
+    request: &'a SAShellRequest,
+}
+impl ValidatedDestination<'_> {
+    fn prepare(&self) -> Result<PreparedDestination, SAShellFailure> {
         #[cfg(test)]
         PREPARATIONS.with(|count| count.set(count.get() + 1));
         #[cfg(test)]
         if FAIL_NEXT_PREPARATION.with(|fail| fail.replace(false)) {
             return Err(SAShellFailure::AllocationFailed);
         }
-        let count = match &self.destination {
+        let count = match &self.request.destination {
             SAShellDestination::Url(url) => url.encode_utf16().count(),
             SAShellDestination::File(path) => path.as_os_str().encode_wide().count(),
         };
@@ -96,12 +108,48 @@ impl SAShellRequest {
                 .ok_or(SAShellFailure::AllocationFailed)?,
         )
         .map_err(|_| SAShellFailure::AllocationFailed)?;
-        match &self.destination {
+        match &self.request.destination {
             SAShellDestination::Url(url) => wide.extend(url.encode_utf16()),
             SAShellDestination::File(path) => wide.extend(path.as_os_str().encode_wide()),
         }
         wide.push(0);
         Ok(PreparedDestination { wide })
+    }
+}
+
+// Ownership binds the proof to exactly this request through helper admission.
+// No mutable request access escapes, and every rejection returns the original.
+struct ValidatedRequest {
+    request: SAShellRequest,
+}
+impl ValidatedRequest {
+    fn new(request: SAShellRequest) -> Result<Self, SAShellRejected> {
+        if let Err(reason) = request.validate() {
+            return Err(SAShellRejected { request, reason });
+        }
+        Ok(Self { request })
+    }
+
+    fn reject(self, reason: SAShellFailure) -> SAShellRejected {
+        SAShellRejected {
+            request: self.request,
+            reason,
+        }
+    }
+
+    fn prepare(self) -> Result<PreparedRequest, SAShellRejected> {
+        let destination = match (ValidatedDestination {
+            request: &self.request,
+        })
+        .prepare()
+        {
+            Ok(destination) => destination,
+            Err(reason) => return Err(self.reject(reason)),
+        };
+        Ok(PreparedRequest {
+            request: self.request,
+            destination,
+        })
     }
 }
 
@@ -132,6 +180,7 @@ impl PreparedRequest {
 }
 #[cfg(test)]
 thread_local! {
+    static VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PREPARATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FAIL_NEXT_PREPARATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -392,28 +441,22 @@ impl ShellHelper {
         })
     }
 
-    pub(crate) fn try_launch(
+    #[cfg(test)]
+    fn try_launch(&self, request: SAShellRequest) -> Result<SAShellReceipt, SAShellRejected> {
+        self.try_launch_validated(ValidatedRequest::new(request)?)
+    }
+
+    fn try_launch_validated(
         &self,
-        request: SAShellRequest,
+        request: ValidatedRequest,
     ) -> Result<SAShellReceipt, SAShellRejected> {
-        if let Err(reason) = request.validate() {
-            return Err(SAShellRejected { request, reason });
-        }
         // This is advisory only: it publishes no receipt or reservation. Full
         // helpers reject before private encoding, so CapacityFull can precede
         // an incidental AllocationFailed that preparation once exposed.
         if let Some(reason) = lock(&self.shared.state).admission_failure() {
-            return Err(SAShellRejected { request, reason });
+            return Err(request.reject(reason));
         }
-        let destination = match request.prepare() {
-            Ok(destination) => destination,
-            Err(reason) => return Err(SAShellRejected { request, reason }),
-        };
-        let prepared = PreparedRequest {
-            request,
-            destination,
-        };
-        self.admit(prepared)
+        self.admit(request.prepare()?)
     }
 
     fn admit(&self, prepared: PreparedRequest) -> Result<SAShellReceipt, SAShellRejected> {
@@ -681,11 +724,16 @@ mod tests {
             };
             assert_eq!(prepared.wide(), expected);
             assert_eq!(counts.allocations, 1);
+            assert_eq!(
+                counts.requested_bytes,
+                expected.len() * std::mem::size_of::<u16>()
+            );
             assert_eq!(counts.reallocations, 0);
             assert_eq!(PREPARATIONS.with(|count| count.get()), 1);
             println!(
-                "shell validation allocations=0 preparation allocations={} preparations=1 units={}",
+                "shell validation allocations=0 preparation allocations={} requested_bytes={} preparations=1 units={}",
                 counts.allocations,
+                counts.requested_bytes,
                 expected.len()
             );
         }
@@ -724,9 +772,11 @@ mod tests {
         .unwrap();
         let accepted = request();
         PREPARATIONS.with(|count| count.set(0));
+        VALIDATIONS.with(|count| count.set(0));
         let (receipt, counts) =
             crate::allocation_probe::measure(|| helper.try_launch(accepted).unwrap());
         assert_eq!(PREPARATIONS.with(|count| count.get()), 1);
+        assert_eq!(VALIDATIONS.with(|count| count.get()), 1);
         assert_eq!(
             counts.allocations, 2,
             "one destination backing plus one receipt"
@@ -734,8 +784,8 @@ mod tests {
         assert_eq!(counts.reallocations, 0);
         observed.recv_timeout(Duration::from_secs(3)).unwrap();
         println!(
-            "shell accepted preparations=1 admission allocations={} (buffer+receipt)",
-            counts.allocations
+            "shell accepted validations=1 preparations=1 admission allocations={} requested_bytes={} (buffer+receipt)",
+            counts.allocations, counts.requested_bytes
         );
         let original = request();
         PREPARATIONS.with(|count| count.set(0));
@@ -761,6 +811,9 @@ mod tests {
         assert!(matches!(rejected.reason, SAShellFailure::InvalidInput(_)));
         assert_eq!(PREPARATIONS.with(|count| count.get()), 0);
         helper.close();
+        let rejected = helper.try_launch(invalid.clone()).unwrap_err();
+        assert_eq!(rejected.request, invalid);
+        assert!(matches!(rejected.reason, SAShellFailure::InvalidInput(_)));
         let submitted = original.clone();
         let (rejected, counts) =
             crate::allocation_probe::measure(|| helper.try_launch(submitted).unwrap_err());

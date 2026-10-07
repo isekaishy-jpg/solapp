@@ -1,6 +1,8 @@
 //! Host admission and final access for association opening.
 
-use super::{SAShellFailure, SAShellReceipt, SAShellRejected, SAShellRequest, ShellHelper};
+use super::{
+    SAShellFailure, SAShellReceipt, SAShellRejected, SAShellRequest, ShellHelper, ValidatedRequest,
+};
 use crate::host::{Core, SAApplication, SAStopReason};
 use crate::{SAContext, SAError};
 
@@ -39,18 +41,22 @@ impl<A: SAApplication> SAContext<'_, A> {
                 } else {
                     Err(SAShellFailure::Closed)
                 }
-            })
-            .and_then(|()| request.validate());
+            });
         if let Err(reason) = admission {
             return Err(SAShellRejected { request, reason });
         }
+        let request = ValidatedRequest::new(request)?;
         if self.core.shell.is_none() {
             match ShellHelper::new(self.core.id, self.core.shell_capacity) {
                 Ok(helper) => self.core.shell = Some(helper),
-                Err(reason) => return Err(SAShellRejected { request, reason }),
+                Err(reason) => return Err(request.reject(reason)),
             }
         }
-        self.core.shell.as_ref().unwrap().try_launch(request)
+        self.core
+            .shell
+            .as_ref()
+            .unwrap()
+            .try_launch_validated(request)
     }
 
     /// Number of accepted requests whose native call or payload reclamation
@@ -256,5 +262,107 @@ mod tests {
         assert_eq!(core.state, SAHostState::Closed);
         assert_eq!(core.shutdown_snapshot().pending_native_destructions, 0);
         assert_eq!(app.stops, 1);
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::super::{PREPARATIONS, VALIDATIONS};
+    use super::*;
+    use crate::backend::BackendOps;
+    use crate::{SAContextPhase, SAShellDestination, SAShellOutcome, SAStopProgress};
+    use std::time::{Duration, Instant};
+    struct App;
+    impl SAApplication for App {
+        type Message = ();
+        type LocalEvent = ();
+        fn started(&mut self, _: &mut SAContext<'_, Self>) -> Result<(), SAError> {
+            Ok(())
+        }
+        fn stopping(&mut self, _: &mut SAContext<'_, Self>) -> SAStopProgress {
+            SAStopProgress::Settled
+        }
+    }
+    #[test]
+    fn context_validates_once_before_helper_admission_and_closed_precedes_invalid() {
+        let mut core = Core::<App>::new().unwrap();
+        core.shell = Some(
+            ShellHelper::spawn(core.id, 1, || |_: &super::super::PreparedRequest| Ok(())).unwrap(),
+        );
+        let request = SAShellRequest {
+            destination: SAShellDestination::Url("custom:unicode".into()),
+        };
+        VALIDATIONS.with(|count| count.set(0));
+        PREPARATIONS.with(|count| count.set(0));
+        let (receipt, counts) = crate::allocation_probe::measure(|| {
+            SAContext::new(&mut core, BackendOps::Unavailable, SAContextPhase::Startup)
+                .request_shell(request)
+                .unwrap()
+        });
+        assert_eq!(VALIDATIONS.with(|count| count.get()), 1);
+        assert_eq!(PREPARATIONS.with(|count| count.get()), 1);
+        assert_eq!(counts.allocations, 2);
+        assert_eq!(counts.reallocations, 0);
+        println!(
+            "context shell validations=1 preparations=1 allocations={} requested_bytes={}",
+            counts.allocations, counts.requested_bytes
+        );
+        core.request_stop(SAStopReason::Application);
+        let invalid = SAShellRequest {
+            destination: SAShellDestination::Url("invalid".into()),
+        };
+        VALIDATIONS.with(|count| count.set(0));
+        let rejected = SAContext::new(
+            &mut core,
+            BackendOps::Unavailable,
+            SAContextPhase::Retirement,
+        )
+        .request_shell(invalid.clone())
+        .unwrap_err();
+        assert_eq!(rejected.request, invalid);
+        assert_eq!(rejected.reason, SAShellFailure::Closed);
+        assert_eq!(VALIDATIONS.with(|count| count.get()), 0);
+        let helper = core.shell.as_mut().unwrap();
+        helper.close();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !helper.poll_closed().unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(receipt.outcome(), SAShellOutcome::Complete(Ok(())));
+        core.shell = None;
+    }
+    #[test]
+    fn lazy_helper_startup_failure_returns_validated_original_without_preparation() {
+        let mut core = Core::<App>::new().unwrap();
+        core.shell_capacity = 0;
+        let request = SAShellRequest {
+            destination: SAShellDestination::Url("custom:destination".into()),
+        };
+        VALIDATIONS.with(|count| count.set(0));
+        PREPARATIONS.with(|count| count.set(0));
+        let rejected = SAContext::new(&mut core, BackendOps::Unavailable, SAContextPhase::Startup)
+            .request_shell(request.clone())
+            .unwrap_err();
+        assert_eq!(rejected.request, request);
+        assert_eq!(
+            rejected.reason,
+            SAShellFailure::InvalidInput("shell capacity must be positive")
+        );
+        assert_eq!(VALIDATIONS.with(|count| count.get()), 1);
+        assert_eq!(PREPARATIONS.with(|count| count.get()), 0);
+        assert!(core.shell.is_none());
+        let invalid = SAShellRequest {
+            destination: SAShellDestination::Url("invalid".into()),
+        };
+        let rejected = SAContext::new(&mut core, BackendOps::Unavailable, SAContextPhase::Startup)
+            .request_shell(invalid.clone())
+            .unwrap_err();
+        assert_eq!(rejected.request, invalid);
+        assert_eq!(
+            rejected.reason,
+            SAShellFailure::InvalidInput("URL needs a scheme")
+        );
+        assert!(core.shell.is_none());
     }
 }

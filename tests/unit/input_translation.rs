@@ -491,12 +491,26 @@ fn output_backing_matches_complete_event_and_ignores_held_key_population() {
             counts.allocations
         );
     }
-    let focus = translate(
-        &mut adapter,
-        target,
-        &WindowEvent::Focused(false),
-        &held,
-        &mut text,
+    let (focus, counts) = crate::allocation_probe::measure(|| {
+        translate(
+            &mut adapter,
+            target,
+            &WindowEvent::Focused(false),
+            &held,
+            &mut text,
+        )
+    });
+    assert_eq!(counts.allocations, 1);
+    assert_eq!(
+        counts.requested_bytes,
+        4099 * std::mem::size_of::<NormalizedInput>()
+    );
+    assert_eq!(counts.reallocations, 0);
+    println!(
+        "input retained Vec fallback records=4099 backing_bytes={} vec_size={} record_size={}",
+        counts.requested_bytes,
+        std::mem::size_of::<Vec<NormalizedInput>>(),
+        std::mem::size_of::<NormalizedInput>()
     );
     assert_eq!(focus.len(), 4099);
     assert_eq!(focus.capacity(), 4099);
@@ -866,4 +880,247 @@ fn mouse_modifier_and_relative_motion_records_keep_observed_units_and_origins() 
             .chain(&modifiers)
             .all(|record| record.origin == SAInputOrigin::NativeWindow && record.device.is_none())
     );
+}
+
+#[test]
+fn receipt_is_complete_before_nested_callbacks_and_stale_text_is_skipped() {
+    use crate::backend::{BackendOps, test::TestBackend};
+    use crate::host::Core;
+    use crate::*;
+    struct App {
+        trace: Vec<&'static str>,
+        session: Option<SATextSessionId>,
+    }
+    impl SAApplication for App {
+        type Message = ();
+        type LocalEvent = ();
+        fn started(&mut self, _: &mut SAContext<'_, Self>) -> Result<(), SAError> {
+            Ok(())
+        }
+        fn stopping(&mut self, _: &mut SAContext<'_, Self>) -> SAStopProgress {
+            SAStopProgress::Settled
+        }
+    }
+    fn handler(
+        app: &mut App,
+        cx: &mut SAContext<'_, App>,
+        event: &SAEvent<'_, (), ()>,
+    ) -> SAPropagation {
+        if let SAEvent::Input(record) = event {
+            match record.event {
+                SAInputEvent::Key { .. } => {
+                    app.trace.push("key");
+                    // Both members of the original receipt are queued before
+                    // the first callback; replacing the session cannot retag it.
+                    assert_eq!(cx.core.input.queue.len(), 1);
+                    cx.end_text(app.session.take().unwrap()).unwrap();
+                    let batch = cx
+                        .core
+                        .native_input
+                        .device_event(
+                            Some(record.target),
+                            &DeviceEvent::MouseMotion {
+                                delta: (1.25, -2.5),
+                            },
+                            SAInputDeviceId {
+                                host: record.target.id.host(),
+                                native: DeviceId::dummy(),
+                            },
+                        )
+                        .unwrap();
+                    cx.receive_input_batch(app, batch).unwrap();
+                }
+                SAInputEvent::RelativeMotion { x: 1.25, y: -2.5 } => {
+                    app.trace.push("nested motion")
+                }
+                SAInputEvent::Text { .. } => panic!("old session must not be delivered"),
+                _ => (),
+            }
+        }
+        SAPropagation::Continue
+    }
+    let mut core = Core::<App>::new().unwrap();
+    let mut backend = TestBackend::default();
+    let mut app = App {
+        trace: Vec::new(),
+        session: None,
+    };
+    let mut cx = SAContext::new(
+        &mut core,
+        BackendOps::Test(&mut backend),
+        SAContextPhase::Startup,
+    );
+    let target = cx.create_window(SAWindowSpec::default()).unwrap();
+    app.session = Some(
+        cx.begin_text(
+            target,
+            SATextCaret {
+                position: SAPhysicalPosition { x: 0.0, y: 0.0 },
+                size: SAPhysicalSize {
+                    width: 1,
+                    height: 1,
+                },
+            },
+        )
+        .unwrap(),
+    );
+    let recipient = cx.create_recipient().unwrap();
+    cx.subscribe(
+        recipient,
+        SAEventFilter::All,
+        SAPriority::default(),
+        handler,
+    )
+    .unwrap();
+    let state = SAInputState::default();
+    let batch = cx
+        .core
+        .native_input
+        .key_event(
+            target,
+            PhysicalKey::Code(KeyCode::Enter),
+            &Key::Named(NamedKey::Enter),
+            KeyLocation::Standard,
+            ElementState::Pressed,
+            false,
+            false,
+            Some("\r"),
+            &state,
+            &cx.core.text,
+        )
+        .unwrap();
+    assert_eq!(batch.len(), 2);
+    cx.with_input_deferred(&mut app, |app, cx| {
+        cx.receive_input_batch(app, batch).unwrap();
+        assert_eq!(cx.core.input.queue.len(), 2);
+        assert!(app.trace.is_empty());
+    });
+    cx.drain_input(&mut app, 8).unwrap();
+    assert_eq!(app.trace, ["key", "nested motion"]);
+    assert!(cx.core.input.queue.is_empty());
+}
+
+#[test]
+fn key_map_reservation_failure_preserves_original_meaning_and_text_state() {
+    let target = target();
+    let mut adapter = NativeInputAdapter::new();
+    let mut text = TextState::new();
+    let session = begin(&mut text, target);
+    let state = SAInputState {
+        held_keys: vec![SAPhysicalKey::ScanCode(0xe01d)],
+        ..Default::default()
+    };
+    adapter
+        .key_event(
+            target,
+            PhysicalKey::Code(KeyCode::ControlRight),
+            &Key::Named(NamedKey::Control),
+            KeyLocation::Right,
+            ElementState::Pressed,
+            false,
+            false,
+            None,
+            &state,
+            &text,
+        )
+        .unwrap();
+    adapter.fail_next_key_reservation = true;
+    let failed = adapter.key_event(
+        target,
+        PhysicalKey::Code(KeyCode::ControlRight),
+        &Key::Character("changed".into()),
+        KeyLocation::Standard,
+        ElementState::Pressed,
+        false,
+        false,
+        Some("changed"),
+        &state,
+        &text,
+    );
+    assert!(matches!(failed, Err(SAError::AllocationFailed)));
+    assert_eq!(text.active(target), Some(session));
+    let retry = translate(
+        &mut adapter,
+        target,
+        &WindowEvent::Focused(false),
+        &state,
+        &mut text,
+    );
+    assert!(matches!(
+        retry[0].event,
+        SAInputEvent::Key {
+            logical: SALogicalKey::Named(SANamedKey::Control),
+            location: SAKeyLocation::Right,
+            ..
+        }
+    ));
+}
+
+#[test]
+#[ignore = "Optimized repeated throughput evidence; run explicitly without compiler contention."]
+fn normalized_receipt_movement_benchmark() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    let target = target();
+    let mut adapter = NativeInputAdapter::new();
+    let mut text = TextState::new();
+    let empty = SAInputState::default();
+    let one_button = SAInputState {
+        held_buttons: vec![SAMouseButton::Left],
+        ..Default::default()
+    };
+    let many = SAInputState {
+        held_keys: (0..4098).map(SAPhysicalKey::ScanCode).collect(),
+        ..Default::default()
+    };
+    let cases = [
+        ("zero", WindowEvent::CloseRequested, &empty, 0, 100_000),
+        (
+            "one",
+            WindowEvent::CursorMoved {
+                device_id: DeviceId::dummy(),
+                position: winit::dpi::PhysicalPosition::new(1.25, 3.5),
+            },
+            &empty,
+            1,
+            100_000,
+        ),
+        (
+            "two",
+            WindowEvent::MouseCaptureLost,
+            &one_button,
+            2,
+            100_000,
+        ),
+        ("fallback", WindowEvent::Focused(false), &many, 4099, 1_000),
+    ];
+    for (label, event, state, output, iterations) in cases {
+        let mut run = || {
+            let batch = translate(
+                &mut adapter,
+                target,
+                black_box(&event),
+                black_box(state),
+                &mut text,
+            );
+            assert_eq!(batch.len(), output);
+            for record in batch {
+                black_box(record);
+            }
+        };
+        for _ in 0..1000 {
+            run();
+        }
+        for sample in 0..7 {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                run();
+            }
+            let elapsed = start.elapsed().as_nanos();
+            println!(
+                "input-movement,{label},{sample},{iterations},{output},{elapsed},{}",
+                elapsed as f64 / iterations as f64
+            );
+        }
+    }
 }

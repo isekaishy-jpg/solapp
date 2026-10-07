@@ -58,7 +58,7 @@ pub(crate) struct Arena<T> {
     kind: SAIdentityKind,
     free_head: Option<u32>,
     #[cfg(test)]
-    selection_steps: usize,
+    reservation_slot_reads: usize,
 }
 impl<T> Arena<T> {
     pub(crate) fn new(kind: SAIdentityKind) -> Self {
@@ -67,17 +67,20 @@ impl<T> Arena<T> {
             kind,
             free_head: None,
             #[cfg(test)]
-            selection_steps: 0,
+            reservation_slot_reads: 0,
         }
     }
     pub(crate) fn reserve(&mut self) -> Result<SlotKey, SAError> {
         // The candidate remains available until insert commits it. Companion
         // reservations may fail without needing a separate rollback operation.
-        #[cfg(test)]
-        {
-            self.selection_steps += 1;
-        }
         if let Some(index) = self.free_head {
+            #[cfg(test)]
+            {
+                // Count the existing slot actually read below, not reserve calls.
+                // Fresh growth writes a new slot and may allocate/copy backing;
+                // neither is an existing-slot selection read.
+                self.reservation_slot_reads += 1;
+            }
             return Ok(SlotKey {
                 index,
                 generation: self.entries[index as usize].incarnation.unwrap(),
@@ -140,6 +143,7 @@ impl<T> Arena<T> {
         }
         Some(value)
     }
+    #[cfg(test)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (SlotKey, &T)> {
         self.entries.iter().enumerate().filter_map(|(index, slot)| {
             Some((

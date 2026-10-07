@@ -141,6 +141,8 @@ pub(crate) struct Dispatch<A: SAApplication> {
     pub(crate) fail_next_marker_reservation: bool,
     #[cfg(test)]
     pub(crate) fail_next_order_reservation: bool,
+    #[cfg(test)]
+    retirement_steps: (usize, usize),
     next_sequence: u64,
     pub(crate) depth: usize,
 }
@@ -156,6 +158,8 @@ impl<A: SAApplication> Dispatch<A> {
             fail_next_marker_reservation: false,
             #[cfg(test)]
             fail_next_order_reservation: false,
+            #[cfg(test)]
+            retirement_steps: (0, 0),
             next_sequence: 1,
             depth: 0,
         }
@@ -265,18 +269,43 @@ impl<A: SAApplication> Dispatch<A> {
             .ok_or(SAError::StaleIdentity)?;
         recipient.alive = false;
         let active_callbacks = recipient.active;
-        // No callback or user destructor runs while traversing this registry.
-        loop {
-            let key = self
+        // Traverse occupied order once, retaining active records until release.
+        // No callback or user destructor runs here. At each removal `write` is
+        // its gap after earlier removals: moving markers strictly beyond it
+        // gives new_gap = old_gap - removed_entries_before_old_gap.
+        // Work is O(S + R * D), bounded by O(S * (D + 1)); vector growth and
+        // ordinary insertion/unsubscription are separate operations.
+        let mut write = 0;
+        for read in 0..self.order.len() {
+            #[cfg(test)]
+            {
+                self.retirement_steps.0 += 1;
+            }
+            let entry = self.order[read];
+            let record = self
                 .subscriptions
-                .iter()
-                .find(|(_, record)| record.recipient == id && record.alive)
-                .map(|(key, _)| key);
-            let Some(key) = key else {
-                break;
-            };
-            self.unsubscribe(host, SASubscriptionId { host, key })?;
+                .get_mut(entry.1)
+                .expect("occupied order retains its subscription");
+            if record.recipient == id && record.alive {
+                record.alive = false;
+                if record.active == 0 {
+                    self.subscriptions.remove(entry.1);
+                }
+                for marker in &mut self.markers {
+                    #[cfg(test)]
+                    {
+                        self.retirement_steps.1 += 1;
+                    }
+                    if write < *marker {
+                        *marker -= 1;
+                    }
+                }
+            } else {
+                self.order[write] = entry;
+                write += 1;
+            }
         }
+        self.order.truncate(write);
         if active_callbacks == 0 {
             self.recipients.remove(id.key);
         }
@@ -365,5 +394,103 @@ impl<A: SAApplication> Dispatch<A> {
         if !record.alive && record.active == 0 {
             self.recipients.remove(recipient.key);
         }
+    }
+}
+
+#[cfg(test)]
+impl<A: SAApplication> Dispatch<A> {
+    pub(crate) fn test_retirement_steps(&self) -> (usize, usize) {
+        self.retirement_steps
+    }
+    // The pre-compaction implementation remains an independent mutation oracle.
+    pub(crate) fn reference_retire_recipient(
+        &mut self,
+        host: SAHostId,
+        id: SARecipientId,
+    ) -> Result<SARecipientState, SAError> {
+        self.live_recipient(host, id)?;
+        let recipient = self.recipients.get_mut(id.key).unwrap();
+        recipient.alive = false;
+        let active_callbacks = recipient.active;
+        loop {
+            let key = self
+                .subscriptions
+                .iter()
+                .find(|(_, record)| record.recipient == id && record.alive)
+                .map(|(key, _)| key);
+            let Some(key) = key else {
+                break;
+            };
+            self.unsubscribe(host, SASubscriptionId { host, key })?;
+        }
+        if active_callbacks == 0 {
+            self.recipients.remove(id.key);
+        }
+        Ok(SARecipientState {
+            retired: true,
+            active_callbacks,
+        })
+    }
+
+    pub(crate) fn test_markers(&self) -> &[usize] {
+        &self.markers
+    }
+
+    pub(crate) fn assert_same_routing_order(&self, other: &Self) {
+        let view = |dispatch: &Self| {
+            dispatch
+                .order
+                .iter()
+                .map(|(rank, key)| {
+                    let record = dispatch.subscriptions.get(*key).unwrap();
+                    (
+                        rank.priority,
+                        rank.sequence,
+                        record.recipient,
+                        record.filter,
+                        record.handler as usize,
+                        record.active,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(view(self), view(other));
+    }
+
+    pub(crate) fn assert_same_registry(&self, other: &Self) {
+        assert_eq!(self.markers, other.markers);
+        assert_eq!(
+            self.order
+                .iter()
+                .map(|(rank, key)| (rank.priority, rank.sequence, *key))
+                .collect::<Vec<_>>(),
+            other
+                .order
+                .iter()
+                .map(|(rank, key)| (rank.priority, rank.sequence, *key))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            self.subscriptions
+                .iter()
+                .map(|(key, record)| (key, record.recipient, record.alive, record.active))
+                .collect::<Vec<_>>(),
+            other
+                .subscriptions
+                .iter()
+                .map(|(key, record)| (key, record.recipient, record.alive, record.active))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            self.recipients
+                .iter()
+                .map(|(key, record)| (key, record.alive, record.active))
+                .collect::<Vec<_>>(),
+            other
+                .recipients
+                .iter()
+                .map(|(key, record)| (key, record.alive, record.active))
+                .collect::<Vec<_>>()
+        );
     }
 }

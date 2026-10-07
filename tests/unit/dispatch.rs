@@ -2,6 +2,253 @@ use crate::backend::BackendOps;
 use crate::host::Core;
 use crate::*;
 
+#[test]
+#[ignore = "release-build measurement; no timing thresholds"]
+fn recipient_retirement_scaling_measurement() {
+    use std::{hint::black_box, time::Instant};
+    for (peak, live, depth) in [
+        (128, 128, 0),
+        (1024, 1024, 0),
+        (4096, 4096, 0),
+        (16384, 16384, 0),
+        (4096, 4096, 8),
+        (32768, 128, 0),
+    ] {
+        for trial in 0..7 {
+            let mut core = Core::<App>::new().unwrap();
+            let mut cx = SAContext::new(&mut core, BackendOps::Unavailable, SAContextPhase::Event);
+            let mut recipient = cx.create_recipient().unwrap();
+            if peak > live {
+                for _ in 0..peak {
+                    cx.subscribe(
+                        recipient,
+                        SAEventFilter::Local,
+                        SAPriority::default(),
+                        first,
+                    )
+                    .unwrap();
+                }
+                cx.retire_recipient(recipient).unwrap();
+                recipient = cx.create_recipient().unwrap();
+            }
+            for _ in 0..live {
+                cx.subscribe(
+                    recipient,
+                    SAEventFilter::Local,
+                    SAPriority::default(),
+                    first,
+                )
+                .unwrap();
+            }
+            for _ in 0..depth {
+                cx.core.dispatch.begin().unwrap();
+            }
+            let start = Instant::now();
+            black_box(cx.retire_recipient(black_box(recipient)).unwrap());
+            println!(
+                "recipient-retirement peak={peak} live={live} depth={depth} trial={trial} elapsed_ns={}",
+                start.elapsed().as_nanos()
+            );
+            for marker in (0..depth).rev() {
+                cx.core.dispatch.end(marker);
+            }
+        }
+    }
+}
+
+#[test]
+fn recipient_compaction_matches_repeated_unsubscribe_for_every_nested_gap_and_removal_mask() {
+    use crate::dispatch::{Dispatch, Recipient};
+    fn registry(
+        host: SAHostId,
+        mask: usize,
+    ) -> (Dispatch<App>, [SARecipientId; 2], Vec<SASubscriptionId>) {
+        let mut dispatch = Dispatch::new();
+        let recipients = std::array::from_fn(|_| {
+            let key = dispatch.recipients.reserve().unwrap();
+            dispatch.recipients.insert(
+                key,
+                Recipient {
+                    alive: true,
+                    active: 0,
+                },
+            );
+            SARecipientId { host, key }
+        });
+        let ids = (0..6)
+            .map(|index| {
+                dispatch
+                    .subscribe(
+                        host,
+                        recipients[usize::from(mask & (1 << index) == 0)],
+                        SAEventFilter::Local,
+                        SAPriority::new((6 - index) as f64).unwrap(),
+                        first,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        (dispatch, recipients, ids)
+    }
+    let host = SAHostId::allocate().unwrap();
+    for mask in 0..64 {
+        for outer_gap in 0..=6 {
+            for inner_gap in 0..=6 {
+                let (mut actual, recipients, ids) = registry(host, mask);
+                let (mut reference, _, _) = registry(host, mask);
+                // Nested callbacks can retain the same subscription more than once.
+                for _ in 0..2 {
+                    actual.claim(ids[2].key);
+                    reference.claim(ids[2].key);
+                }
+                for gap in [outer_gap, inner_gap, 6 - outer_gap] {
+                    let a = actual.begin().unwrap();
+                    let b = reference.begin().unwrap();
+                    for _ in 0..gap {
+                        assert_eq!(
+                            actual.next(a, None, SAEventFilter::Local),
+                            reference.next(b, None, SAEventFilter::Local)
+                        );
+                    }
+                }
+                assert_eq!(
+                    actual.retire_recipient(host, recipients[0]),
+                    reference.reference_retire_recipient(host, recipients[0])
+                );
+                actual.assert_same_registry(&reference);
+                let expected: Vec<_> = [outer_gap, inner_gap, 6 - outer_gap]
+                    .into_iter()
+                    .map(|gap| gap - (0..gap).filter(|index| mask & (1 << index) != 0).count())
+                    .collect();
+                assert_eq!(actual.test_markers(), expected);
+                // Insert before, at and after surviving gaps, including equal priorities.
+                // Freed slot choice can differ: compare routed handlers and recipient incarnations.
+                for priority in [20.0, 6.0, 5.5, 5.0, 4.0, 3.0, 2.0, 1.0, -1.0] {
+                    actual
+                        .subscribe(
+                            host,
+                            recipients[1],
+                            SAEventFilter::Local,
+                            SAPriority::new(priority).unwrap(),
+                            second,
+                        )
+                        .unwrap();
+                    reference
+                        .subscribe(
+                            host,
+                            recipients[1],
+                            SAEventFilter::Local,
+                            SAPriority::new(priority).unwrap(),
+                            second,
+                        )
+                        .unwrap();
+                    assert_eq!(actual.test_markers(), reference.test_markers());
+                    actual.assert_same_routing_order(&reference);
+                }
+                for marker in (0..3).rev() {
+                    loop {
+                        let a = actual.next(marker, None, SAEventFilter::Local);
+                        let b = reference.next(marker, None, SAEventFilter::Local);
+                        match (a, b) {
+                            (Some(a), Some(b)) => {
+                                let (ah, ar) = actual.claim(a);
+                                let (bh, br) = reference.claim(b);
+                                assert_eq!((ah as usize, ar), (bh as usize, br));
+                                actual.release(a, ar);
+                                reference.release(b, br);
+                            }
+                            (None, None) => break,
+                            _ => panic!("different nested callback trace"),
+                        }
+                    }
+                    actual.end(marker);
+                    reference.end(marker);
+                }
+                let active_recipient = if mask & 4 != 0 {
+                    recipients[0]
+                } else {
+                    recipients[1]
+                };
+                for remaining in (0..2).rev() {
+                    actual.release(ids[2].key, active_recipient);
+                    reference.release(ids[2].key, active_recipient);
+                    if active_recipient == recipients[0] {
+                        assert_eq!(
+                            actual
+                                .recipient(host, active_recipient)
+                                .map(|record| record.active),
+                            if remaining == 0 {
+                                Err(SAError::StaleIdentity)
+                            } else {
+                                Ok(remaining)
+                            }
+                        );
+                    }
+                }
+                assert_eq!(
+                    actual.live_recipient(host, recipients[0]),
+                    Err(SAError::StaleIdentity)
+                );
+                assert_eq!(
+                    actual.unsubscribe(host, ids[2]),
+                    reference.unsubscribe(host, ids[2])
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn retirement_visits_occupied_order_once_and_each_removed_entry_checks_active_markers() {
+    for (peak, live, depth) in [
+        (128, 128, 0),
+        (1024, 1024, 1),
+        (4096, 4096, 8),
+        (65536, 128, 8),
+    ] {
+        let mut core = Core::<App>::new().unwrap();
+        let mut cx = SAContext::new(&mut core, BackendOps::Unavailable, SAContextPhase::Event);
+        let old = cx.create_recipient().unwrap();
+        for _ in 0..peak {
+            cx.subscribe(old, SAEventFilter::Local, SAPriority::default(), first)
+                .unwrap();
+        }
+        cx.retire_recipient(old).unwrap();
+        let retired = cx.create_recipient().unwrap();
+        let survivor = cx.create_recipient().unwrap();
+        for index in 0..live {
+            cx.subscribe(
+                if index % 2 == 0 { retired } else { survivor },
+                SAEventFilter::Local,
+                SAPriority::default(),
+                first,
+            )
+            .unwrap();
+        }
+        for _ in 0..depth {
+            cx.core.dispatch.begin().unwrap();
+        }
+        let before = cx.core.dispatch.test_retirement_steps();
+        let (_, allocation) = crate::allocation_probe::measure(|| {
+            cx.retire_recipient(retired).unwrap();
+        });
+        let after = cx.core.dispatch.test_retirement_steps();
+        assert_eq!(after.0 - before.0, live);
+        assert_eq!(after.1 - before.1, (live / 2) * depth);
+        assert_eq!(allocation.allocations + allocation.reallocations, 0);
+        println!(
+            "retirement-work historical_peak={peak} live={live} removed={} depth={depth} order_visits={} marker_checks={} allocations=0 reallocations=0",
+            live / 2,
+            after.0 - before.0,
+            after.1 - before.1
+        );
+        for marker in (0..depth).rev() {
+            cx.core.dispatch.end(marker);
+        }
+        cx.retire_recipient(survivor).unwrap();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Action {
     None,

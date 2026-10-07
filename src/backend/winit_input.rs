@@ -32,6 +32,8 @@ pub(crate) struct NativeInputAdapter {
     keys: HashMap<(SAWindowTarget, SAPhysicalKey), KeyMeaning>,
     #[cfg(test)]
     fail_next_batch_reservation: std::cell::Cell<bool>,
+    #[cfg(test)]
+    fail_next_key_reservation: bool,
 }
 
 impl NativeInputAdapter {
@@ -40,6 +42,8 @@ impl NativeInputAdapter {
             keys: HashMap::new(),
             #[cfg(test)]
             fail_next_batch_reservation: std::cell::Cell::new(false),
+            #[cfg(test)]
+            fail_next_key_reservation: false,
         }
     }
 
@@ -319,6 +323,10 @@ impl NativeInputAdapter {
         let logical = logical_key(logical);
         let location = key_location(location);
         if key_state == SAButtonState::Pressed {
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_next_key_reservation) {
+                return Err(SAError::AllocationFailed);
+            }
             self.keys
                 .try_reserve(1)
                 .map_err(|_| SAError::AllocationFailed)?;

@@ -29,6 +29,11 @@ reclamation the old token is stale. Retirement does not authorize destroying
 application state still in use by an active callback. Removing an old token
 cannot remove a new occupant of a reused slot.
 
+Retirement traverses the occupied subscription order once. It adjusts each
+active dispatch marker for each removed entry, so its work is O(S + R * D) for
+S ordered subscriptions, R removals and D active dispatches. It does not scan
+historical vacant subscription slots or allocate temporary storage.
+
 `dispatch_local` borrows its event for the call. A handler may stop propagation
 or explicitly dispatch another event. The configured nesting limit produces a
 typed error. Handlers execute without a host mutex held; budget limits do not
@@ -53,6 +58,16 @@ wait for another drain; a nested drain cannot steal the outer batch's tail.
 Recipient retirement discards obsolete posts. Stop discards an unrouted tail,
 and the owner still reclaims every accepted message. Receipt and proxy observers
 may outlive the closed, empty host.
+
+Empty and singleton drains need no detached batch backing. Larger drains can
+reuse owner-local empty buffers; each active or nested drain owns its buffer
+exclusively. The current private cache retains at most two empty buffers and
+64 KiB of combined element backing, measured from actual capacity and message
+size. Larger batches and deeper nesting remain supported through fallible
+allocation. These limits cover idle backing, excluding active batches, receipts,
+payload-owned storage and allocator overhead. Buffers return only after complete
+settlement and disposal, and cached storage is released when the host closes.
+An oversized drain preserves any smaller idle buffers for later reuse.
 
 The native wake is a hint backed by finite intake rechecks. Close and enqueue
 share one admission lock. A failed wake cannot change an accepted post into a
@@ -93,6 +108,10 @@ claimed timer reports Claimed; cancellation cannot revoke its callback. A stale
 token cannot cancel reused storage. Nesting-limit rejection leaves unclaimed
 due timers and queued input intact. Stop reclaims pending timer payloads on the
 owner, including local payloads borrowing an externally scoped context.
+
+Pending and claimed timer counts take constant work, independent of historical
+timer population. Counts do not replace the separate active-pump and payload
+disposal obligations during shutdown.
 
 Run `events_smoke` for a real native loop accepting a cross-thread post and a
 timer before orderly stop. Deterministic tests cover mutation, close races,

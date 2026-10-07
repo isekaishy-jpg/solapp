@@ -299,6 +299,7 @@ pub(crate) struct Core<A: SAApplication> {
     pub(crate) raw_input: crate::SARawInputState,
     pub(crate) relative_target: Option<crate::SAWindowTarget>,
     pub(crate) transport: std::sync::Arc<crate::post::Transport<A::Message>>,
+    pub(crate) post_batches: crate::post::BatchCache<A::Message>,
     pub(crate) clock: crate::time::Clock,
     pub(crate) nesting_limit: usize,
     pub(crate) event_budget: usize,
@@ -343,6 +344,7 @@ impl<A: SAApplication> Core<A> {
                 config.post_capacity,
                 native_wake.clone(),
             )?),
+            post_batches: crate::post::BatchCache::new(),
             clock: crate::time::Clock::new(id),
             nesting_limit: config.nesting_limit,
             event_budget: config.event_budget,
@@ -700,6 +702,7 @@ impl<A: SAApplication> Core<A> {
         // Winit posts native destruction; dropping roots is not completion.
         if self.native_windows.is_empty() {
             self.state = SAHostState::Closed;
+            self.post_batches.clear();
         }
     }
 
@@ -712,6 +715,7 @@ impl<A: SAApplication> Core<A> {
         }
         if self.state == SAHostState::Retiring && self.native_windows.is_empty() {
             self.state = SAHostState::Closed;
+            self.post_batches.clear();
         }
     }
 
@@ -762,6 +766,7 @@ impl<A: SAApplication> Core<A> {
             self.retired_windows += 1;
             if self.state == SAHostState::Retiring && self.native_windows.is_empty() {
                 self.state = SAHostState::Closed;
+                self.post_batches.clear();
             }
         }
     }

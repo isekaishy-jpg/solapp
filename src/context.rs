@@ -706,10 +706,13 @@ impl<'cx, A: SAApplication> SAContext<'cx, A> {
     /// Every accepted post receives a terminal receipt, including obsolete targets.
     pub fn drain_posts(&mut self, app: &mut A, budget: usize) -> Result<usize, SAError> {
         self.ordinary()?;
-        let batch = self.core.transport.detach(budget)?;
+        let mut batch = self
+            .core
+            .transport
+            .detach(budget, &mut self.core.post_batches)?;
         let mut consumed = 0;
         let mut failure = None;
-        for post in batch {
+        for post in batch.by_ref() {
             consumed += 1;
             let result = if !self.core.ordinary_open() {
                 post.receipt
@@ -751,6 +754,10 @@ impl<'cx, A: SAApplication> SAContext<'cx, A> {
             if let Err(error) = result {
                 failure.get_or_insert(error);
             }
+        }
+        // A nested service can finish closure before this drain returns.
+        if self.core.state != crate::SAHostState::Closed {
+            self.core.post_batches.recycle(batch);
         }
         if let Some(error) = failure {
             Err(error)

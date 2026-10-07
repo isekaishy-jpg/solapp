@@ -38,7 +38,9 @@ request; success returns a transferable `SAShellReceipt` with a stable host-tagg
 identity. Capacity includes executing requests until the native call and request
 reclamation finish.
 
-Destination validation happens before helper capacity admission. A full helper
+Destination validation happens once after owner/context checks and before lazy
+helper startup and capacity admission. Private ownership binds that validation
+to the immutable request through native preparation. A full helper
 rejects without allocating native destination storage; `CapacityFull` can therefore
 precede an allocation failure that would occur while preparing that destination.
 Accepted requests retain their prepared destination through the native call and

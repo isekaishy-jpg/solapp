@@ -222,28 +222,44 @@ fn arena_candidate_survives_failed_admission_and_exhaustion_never_rejoins_free_c
 }
 
 #[test]
-fn arena_selection_is_linear_for_fresh_admissions_and_constant_for_reuse() {
-    let mut arena = Arena::new(SAIdentityKind::Recipient);
-    let mut keys = Vec::new();
-    for value in 0..4096 {
-        let key = arena.reserve().unwrap();
-        arena.insert(key, value);
-        keys.push(key);
+fn arena_reservation_reads_only_the_free_head_at_adversarial_population_scales() {
+    for peak in [1, 8, 128, 4096, 65536] {
+        let mut arena = Arena::new(SAIdentityKind::Recipient);
+        let mut keys = Vec::new();
+        for value in 0..peak {
+            let key = arena.reserve().unwrap();
+            arena.insert(key, value);
+            keys.push(key);
+        }
+        assert_eq!(
+            arena.reservation_slot_reads, 0,
+            "fresh growth does not select an existing slot"
+        );
+        let capacity = arena.entries.capacity();
+        // An occupied prefix used to make scanning implementations expensive.
+        let last = keys[peak - 1];
+        assert!(arena.remove(last).is_some());
+        for value in 0..128 {
+            let key = arena.reserve().unwrap();
+            assert_eq!(key.index, last.index);
+            arena.insert(key, value);
+            assert!(arena.remove(key).is_some());
+        }
+        assert_eq!(arena.reservation_slot_reads, 128);
+        for key in &keys[..peak - 1] {
+            assert!(arena.remove(*key).is_some());
+        }
+        for value in 0..peak {
+            let key = arena.reserve().unwrap();
+            arena.insert(key, value);
+        }
+        assert_eq!(arena.reservation_slot_reads, 128 + peak);
+        assert_eq!(arena.entries.len(), peak);
+        assert_eq!(arena.entries.capacity(), capacity);
+        println!(
+            "arena-slot-reads peak={peak} fresh_reads=0 occupied_prefix_reuse=128 prefix_reuse_reads=128 full_reuse_reads={peak}; excludes growth/copy cost"
+        );
     }
-    assert_eq!(arena.selection_steps, 4096);
-    let capacity = arena.entries.capacity();
-    for key in &keys {
-        assert!(arena.remove(*key).is_some());
-    }
-    assert_eq!(arena.entries.capacity(), capacity);
-    for value in 0..4096 {
-        let key = arena.reserve().unwrap();
-        arena.insert(key, value);
-    }
-    assert_eq!(arena.selection_steps, 8192);
-    assert_eq!(arena.entries.len(), 4096);
-    assert_eq!(arena.entries.capacity(), capacity);
-    println!("arena-selection: fresh=4096 steps=4096 reuse=4096 steps=4096");
 }
 
 #[test]

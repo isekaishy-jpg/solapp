@@ -41,6 +41,7 @@ pub(crate) struct Timers<L> {
     host: SAHostId,
     records: Arena<Timer<L>>,
     heap: Vec<SlotKey>,
+    claimed: usize,
     pub(crate) depth: usize,
     #[cfg(test)]
     pub(crate) fail_next_heap_reservation: bool,
@@ -52,6 +53,7 @@ impl<L> Timers<L> {
             host,
             records: Arena::new(SAIdentityKind::Timer),
             heap: Vec::new(),
+            claimed: 0,
             depth: 0,
             #[cfg(test)]
             fail_next_heap_reservation: false,
@@ -114,13 +116,19 @@ impl<L> Timers<L> {
         ))
     }
     pub(crate) fn counts(&self) -> (usize, usize) {
-        (
-            self.heap.len(),
-            self.records
-                .iter()
-                .filter(|(_, record)| record.heap_index.is_none())
-                .count(),
-        )
+        (self.heap.len(), self.claimed)
+    }
+    #[cfg(test)]
+    pub(crate) fn scanned_counts(&self) -> (usize, usize) {
+        self.records
+            .iter()
+            .fold((0, 0), |(pending, claimed), (_, record)| {
+                if record.heap_index.is_some() {
+                    (pending + 1, claimed)
+                } else {
+                    (pending, claimed + 1)
+                }
+            })
     }
     pub(crate) fn next_deadline(&self) -> Option<SARawDeadline> {
         self.heap
@@ -139,6 +147,8 @@ impl<L> Timers<L> {
         let key = self.heap[0];
         self.remove_heap(0);
         let record = self.records.get_mut(key).expect("heap record exists");
+        let payload = record.payload.take().expect("unclaimed timer owns payload");
+        self.claimed += 1;
         Some(Claimed {
             id: SATimerId {
                 host: self.host,
@@ -146,11 +156,21 @@ impl<L> Timers<L> {
             },
             recipient: record.recipient,
             deadline: record.deadline,
-            payload: record.payload.take().expect("unclaimed timer owns payload"),
+            payload,
         })
     }
     pub(crate) fn release(&mut self, id: SATimerId) {
-        self.records.remove(id.key);
+        // Only an actual claimed-record release changes the count. Repeated or
+        // stale tokens cannot release another incarnation or underflow it.
+        if id.host == self.host
+            && self
+                .records
+                .get(id.key)
+                .is_some_and(|record| record.heap_index.is_none())
+            && self.records.remove(id.key).is_some()
+        {
+            self.claimed -= 1;
+        }
     }
     pub(crate) fn cancel_next(&mut self) -> Option<L> {
         let key = *self.heap.first()?;
